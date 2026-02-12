@@ -28,6 +28,9 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse
 
 import streamlit as st
+import io
+import zipfile
+import traceback
 import requests
 
 
@@ -1355,14 +1358,15 @@ def build_dossier(
     high_authority_sources = [s.url for s in sources[:16] if s.tier in (1,2,3) and s.authority_score >= 70][:12]
 
     # v4: Evidence Graph (claim clusters) + contradictions + narrative blueprint
-    # v6: Cross-run memory integration
-    memory = load_knowledge_memory()
-    update_knowledge_memory(memory, claim_clusters)
-
+    # NOTE: claim_clusters must be created before we can update cross-run memory.
     claim_clusters = build_claim_clusters(sources, max_sources_scan=18, max_clusters=30)
     cluster_map = map_claim_to_cluster_id(claim_clusters)
     contradictions = build_contradictions_from_conflicts(conflict_matrix, cluster_map)
     narrative_blueprint = build_narrative_blueprint(job, claim_clusters, contradictions)
+
+    # v6: Cross-run memory integration (safe: claim_clusters exists)
+    memory = load_knowledge_memory()
+    update_knowledge_memory(memory, claim_clusters)
 
     open_questions = []
     if not high_authority_sources:
@@ -1527,7 +1531,39 @@ with tab_research:
         log_box.code("\n".join(st.session_state.log_lines), language="text")
 
 
-    def _validate_topic(t: str) -> Tuple[bool, str]:
+    
+    def _make_debug_bundle(job: ResearchJob, dossier: Optional[Dict[str, Any]] = None, exc_tb: Optional[str] = None) -> Dict[str, Any]:
+        """Collect a compact but complete debug bundle for one-shot troubleshooting."""
+        bundle: Dict[str, Any] = {
+            "app": {"name": "uappress_research_engine", "version": "singlefile_v14"},
+            "job_config": asdict(job),
+            "ui_session": {
+                "log_lines": st.session_state.get("log_lines", []) or [],
+            },
+        }
+        if dossier is not None:
+            bundle["dossier_partial"] = {
+                "status": dossier.get("status"),
+                "confidence_overall": dossier.get("confidence_overall"),
+                "metrics": dossier.get("metrics"),
+                "telemetry": dossier.get("telemetry"),
+                "sources": dossier.get("sources"),
+                "evidence_graph": dossier.get("evidence_graph"),
+                "narrative_blueprint": dossier.get("narrative_blueprint"),
+            }
+        if exc_tb:
+            bundle["exception"] = {"traceback": exc_tb}
+        return bundle
+
+    def _debug_bundle_zip_bytes(bundle: Dict[str, Any], dossier: Optional[Dict[str, Any]] = None) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("debug_bundle.json", json.dumps(bundle, indent=2, ensure_ascii=False))
+            if dossier is not None:
+                z.writestr("dossier.json", json.dumps(dossier, indent=2, ensure_ascii=False))
+        return buf.getvalue()
+
+def _validate_topic(t: str) -> Tuple[bool, str]:
         t = (t or "").strip()
         if not t:
             return False, "Primary topic is required."
@@ -1751,11 +1787,52 @@ with tab_research:
                 mime="text/csv",
                 use_container_width=True
             )
+            # Debug Bundle (one-shot troubleshooting artifact)
+            debug_bundle = _make_debug_bundle(job, dossier=dossier, exc_tb=None)
+            st.session_state.last_debug_bundle = debug_bundle
+
+            st.download_button(
+                label="Download debug_bundle.json",
+                data=json.dumps(debug_bundle, indent=2, ensure_ascii=False).encode("utf-8"),
+                file_name=f"uappress_debug_bundle_{dossier.get('job_id','job')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+            st.download_button(
+                label="Download debug_bundle.zip (includes dossier.json)",
+                data=_debug_bundle_zip_bytes(debug_bundle, dossier=dossier),
+                file_name=f"uappress_debug_bundle_{dossier.get('job_id','job')}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+
 
         except requests.HTTPError as e:
             status_box.error(f"HTTP error while calling SerpAPI or fetching sources: {e}")
         except Exception as e:
+            tb = traceback.format_exc()
             status_box.error(f"Unexpected error: {e}")
+            st.code(tb, language="text")
+
+            debug_bundle = _make_debug_bundle(job, dossier=None, exc_tb=tb)
+            st.session_state.last_debug_bundle = debug_bundle
+
+            st.download_button(
+                label="Download debug_bundle.json",
+                data=json.dumps(debug_bundle, indent=2, ensure_ascii=False).encode("utf-8"),
+                file_name=f"uappress_debug_bundle_ERROR_{_now_iso().replace(':','').replace('-','')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+            st.download_button(
+                label="Download debug_bundle.zip",
+                data=_debug_bundle_zip_bytes(debug_bundle, dossier=None),
+                file_name=f"uappress_debug_bundle_ERROR_{_now_iso().replace(':','').replace('-','')}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
 
 
     st.divider()
