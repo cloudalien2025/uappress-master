@@ -1,12 +1,21 @@
+----------------------------------------------------------------------
+FILE: package.json
+PATH: /package.json
+----------------------------------------------------------------------
+
 {
   "name": "uappress-master",
   "private": true,
-  "devDependencies": {
-    "@playwright/test": "^1.41.0"
-  },
+  "version": "1.0.0",
+  "description": "Playwright UI tests for UAPpress Streamlit apps",
   "scripts": {
     "test:ui": "playwright test",
     "test:ui:headed": "playwright test --headed",
-    "test:ui:report": "playwright show-report"
+    "test:ui:debug": "playwright test --debug",
+    "test:ui:update": "playwright test --update-snapshots"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.41.2"
   }
 }
+
