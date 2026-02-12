@@ -16,3 +16,6 @@ venv/
 
 # OS
 .DS_Store
+.venv/
+__pycache__/
+**/__pycache__/
