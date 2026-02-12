@@ -604,8 +604,6 @@ def build_micro_queries(job: ResearchJob, entities: List[str]) -> List[str]:
             continue
         qs.extend([
             # v5: in primary-source mode, bias micro queries to official/academic where possible
-            pass
-
             f'"{e2}" "{t}"',
             f'"{e2}" testimony OR hearing OR statement',
             f'"{e2}" declassified OR FOIA OR report',
@@ -1969,4 +1967,3 @@ with tab_smoke:
             mime="application/json",
             use_container_width=True
         )
-
