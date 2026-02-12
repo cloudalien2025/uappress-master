@@ -1,7 +1,3 @@
-================================================================================
-FILE: research-ui.spec.ts
-PATH: /tests/research-ui.spec.ts
-================================================================================
 import { test, expect } from "@playwright/test";
 
 test.describe("UAPpress Research Engine UI", () => {
