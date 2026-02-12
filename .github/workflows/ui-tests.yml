@@ -1,17 +1,18 @@
+----------------------------------------------------------------------
+FILE: ui-tests.yml
+PATH: /.github/workflows/ui-tests.yml
+----------------------------------------------------------------------
+
 name: UI Tests (Playwright)
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
-  workflow_dispatch:
 
 jobs:
   playwright:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,14 +21,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Install Playwright browsers
+      - name: Install Playwright Browsers
         run: npx playwright install --with-deps chromium
 
+      # Runs tests against your deployed Droplet.
       - name: Run UI tests
+        env:
+          BASE_URL: "http://104.236.44.185:8501"
         run: npm run test:ui
 
       - name: Upload Playwright report
@@ -36,4 +41,4 @@ jobs:
         with:
           name: playwright-report
           path: playwright-report
-          retention-days: 7
+          if-no-files-found: ignore
