@@ -887,11 +887,11 @@ def run_research(job: ResearchJob, serpapi_key: str, openai_key: Optional[str] =
         "queries": [],  # list of {pass, q, results, tier1_3, domains}
         "notes": [],
     }
-telemetry["notes"].append(f"Domain controls: prefer_tier_1_3={job.prefer_tier_1_3}, allowlist={len(job.allowlist_domains or [])}, blocklist={len(job.blocklist_domains or [])}.")
+    telemetry["notes"].append(f"Domain controls: prefer_tier_1_3={job.prefer_tier_1_3}, allowlist={len(job.allowlist_domains or [])}, blocklist={len(job.blocklist_domains or [])}.")
 
-telemetry["notes"].append(f"PDF budgets: max_pdf_downloads={job.max_pdf_downloads}, per_domain_pdf_cap={job.per_domain_pdf_cap}. Primary-source mode={job.primary_source_mode}.")
+    telemetry["notes"].append(f"PDF budgets: max_pdf_downloads={job.max_pdf_downloads}, per_domain_pdf_cap={job.per_domain_pdf_cap}. Primary-source mode={job.primary_source_mode}.")
 
-telemetry["notes"].append(f"Playwright: enabled={job.playwright_fallback}, max_renders={job.max_playwright_renders}, per_domain_cap={job.per_domain_playwright_cap}, timeout_s={job.playwright_timeout_s}.")
+    telemetry["notes"].append(f"Playwright: enabled={job.playwright_fallback}, max_renders={job.max_playwright_renders}, per_domain_cap={job.per_domain_playwright_cap}, timeout_s={job.playwright_timeout_s}.")
 
 
     def progress(msg: str):
@@ -1352,17 +1352,6 @@ def build_dossier(
         if len(conflict_matrix) >= 8:
             break
 
-    # v5: Primary-source mode biases toward official/academic PDFs and proceedings
-    if job.primary_source_mode:
-        qs = [
-            f'"{q_base}" site:.gov OR site:.mil',
-            f'"{q_base}" pdf OR report OR "press release"',
-            f'"{q_base}" hearing OR testimony OR transcript',
-            f'"{q_base}" FOIA OR declassified',
-            f'"{q_base}" site:.edu OR arxiv OR "journal"',
-            f'"{q_base}" timeline',
-        ]
-    else:
     high_authority_sources = [s.url for s in sources[:16] if s.tier in (1,2,3) and s.authority_score >= 70][:12]
 
     # v4: Evidence Graph (claim clusters) + contradictions + narrative blueprint
