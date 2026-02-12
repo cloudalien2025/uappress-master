@@ -572,7 +572,7 @@ def build_macro_queries(job: ResearchJob) -> List[str]:
     focus = f" {job.event_focus.strip()}" if job.event_focus else ""
     q_base = f"{t}{geo}{time_scope}{focus}".strip()
 
-        qs = [
+    qs = [
         f'"{q_base}" site:.gov' if job.include_gov_docs else f'"{q_base}"',
         f'"{q_base}" report OR hearing OR testimony',
         f'"{q_base}" declassified OR FOIA',
