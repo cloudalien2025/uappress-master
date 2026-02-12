@@ -1562,17 +1562,18 @@ with tab_research:
             if dossier is not None:
                 z.writestr("dossier.json", json.dumps(dossier, indent=2, ensure_ascii=False))
         return buf.getvalue()
-
 def _validate_topic(t: str) -> Tuple[bool, str]:
-        t = (t or "").strip()
-        if not t:
-            return False, "Primary topic is required."
-        if len(t) < 6:
-            return False, "Primary topic is too short."
-        vague = {"aliens", "ufo", "uap", "ufos", "disclosure"}
-        if t.lower().strip() in vague:
-            return False, "Topic is too vague. Add a specific event, location, person, program, or date range."
-        return True, ""
+    t = (t or "").strip()
+    if not t:
+        return False, "Primary topic is required."
+    if len(t) < 6:
+        return False, "Primary topic is too short."
+    vague = {"aliens", "ufo", "uap", "ufos", "disclosure"}
+    if t.lower().strip() in vague:
+        return False, "Topic is too vague. Add a specific event, location, person, program, or date range."
+    return True, ""
+
+if run_btn:
 
 
     if run_btn:
