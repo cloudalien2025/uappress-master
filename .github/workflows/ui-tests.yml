@@ -23,6 +23,7 @@ jobs:
 
       - name: Install Playwright Browsers
         run: npx playwright install --with-deps chromium
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -46,13 +47,20 @@ jobs:
           done
           curl -sSf http://127.0.0.1:8501/
 
-      # Runs tests against local Streamlit.
+      - name: Ensure Streamlit is running
+        run: |
+          ps aux | grep -v grep | grep "streamlit run apps/research/app.py" || (echo "Streamlit not running" && exit 1)
 
-      # Runs tests against your deployed Droplet.
       - name: Run UI tests
         env:
           BASE_URL: "http://127.0.0.1:8501"
         run: npm run test:ui
+
+      - name: Dump Streamlit log on failure
+        if: failure()
+        run: |
+          echo "==== streamlit.log (last 200 lines) ===="
+          tail -n 200 streamlit.log || true
 
       - name: Upload Playwright report
         if: always()
