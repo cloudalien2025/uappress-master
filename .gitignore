@@ -20,3 +20,12 @@ venv/
 __pycache__/
 **/__pycache__/
 node_modules/
+
+# Playwright artifacts
+playwright-report/
+test-results/
+
+# Streamlit runtime logs
+streamlit.log
+nohup.out
+*.log
