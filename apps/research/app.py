@@ -1504,7 +1504,7 @@ with st.sidebar:
     micro_skip_cands = st.slider("Skip micro if macro candidates ≥", 8, 40, 16, 1)
 
     st.divider()
-    run_btn = st.button("Run Research", type="primary", use_container_width=True)
+    run_btn = st.button("Run", type="primary", use_container_width=True)
 
 
 
