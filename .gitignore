@@ -1,31 +1,49 @@
+# =========================
 # Python
+# =========================
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.so
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
+# =========================
 # Virtualenv
+# =========================
 .venv/
 venv/
+env/
+ENV/
 
+# =========================
 # Streamlit
+# =========================
 .streamlit/secrets.toml
-
-# OS
-.DS_Store
-.venv/
-__pycache__/
-**/__pycache__/
-node_modules/
-
-# Playwright artifacts
-playwright-report/
-test-results/
-
-# Streamlit runtime logs
 streamlit.log
 nohup.out
+
+# =========================
+# Node / Playwright
+# =========================
+node_modules/
+playwright-report/
+test-results/
+.playwright/
+
+# =========================
+# Logs
+# =========================
 *.log
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
