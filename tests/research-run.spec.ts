@@ -1,4 +1,4 @@
-// tests/research-run.spec.ts — UAPpress Research Engine (Deterministic)
+// tests/research-run.spec.ts — UAPpress Research Engine (Deterministic, viewport-safe)
 import { test, expect } from "@playwright/test";
 
 test.describe("UAPpress Research Engine (Smoke)", () => {
@@ -12,7 +12,7 @@ test.describe("UAPpress Research Engine (Smoke)", () => {
     // Title
     await expect(page.getByText("UAPpress Research Engine", { exact: false })).toBeVisible();
 
-    // Fill topic
+    // Fill topic (exact label match)
     await page.getByLabel("Primary Topic", { exact: true }).fill("ODNI UAP Report 2023");
 
     // Click run (form submit)
@@ -23,8 +23,19 @@ test.describe("UAPpress Research Engine (Smoke)", () => {
 
     // Deterministic assertions (smoke-mode fixture)
     await expect(page.getByText("Research Complete", { exact: false })).toBeVisible();
-    await expect(page.getByText("Mock Source A", { exact: false })).toBeVisible();
-    await expect(page.getByText("Mock Source B", { exact: false })).toBeVisible();
-    await expect(page.getByText("Mock Source C", { exact: false })).toBeVisible();
+
+    // These strings may render below the fold; scroll them into view first.
+    const a = page.getByText("Mock Source A", { exact: false });
+    const b = page.getByText("Mock Source B", { exact: false });
+    const c = page.getByText("Mock Source C", { exact: false });
+
+    await a.first().scrollIntoViewIfNeeded();
+    await expect(a.first()).toBeVisible();
+
+    await b.first().scrollIntoViewIfNeeded();
+    await expect(b.first()).toBeVisible();
+
+    await c.first().scrollIntoViewIfNeeded();
+    await expect(c.first()).toBeVisible();
   });
 });
