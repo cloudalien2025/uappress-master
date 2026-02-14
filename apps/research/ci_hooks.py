@@ -1,0 +1,10 @@
+import os
+import streamlit as st
+
+def ci_smoke_enabled() -> bool:
+    return os.getenv("UAPPRESS_CI_SMOKE", "").strip() == "1" or os.getenv("CI", "").strip() == "1"
+
+def mark_run_done():
+    # This is the stable contract Playwright waits for.
+    # Keep it plain text so getByText() can find it reliably.
+    st.markdown("TEST_HOOK:RUN_DONE")
