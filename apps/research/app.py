@@ -1,68 +1,34 @@
-# apps/research/app.py — UAPpress Research Engine (Production-safe + CI-deterministic)
+# apps/research/app.py — UAPpress Research Engine (Production-safe + Test-deterministic)
 #
-# Goals:
-# - Imports cleanly (import-time safety)
-# - Deterministic CI smoke mode: NO secrets, NO network, NO clicks
-# - Stable Playwright hooks:
-#     TEST_HOOK:APP_LOADED
-#     TEST_HOOK:RUN_DONE
+# CI Contract (Playwright):
+# - Always render: "TEST_HOOK:APP_LOADED"
+# - In CI smoke mode (no secrets), user can:
+#     * Fill "Primary Topic"
+#     * Click "Run Research"
+#     * See: "TEST_HOOK:RUN_DONE" and "Research Complete"
 #
-# Notes:
-# - We do NOT rely solely on CI="1". GitHub Actions typically sets CI="true" and GITHUB_ACTIONS="true".
-# - CI smoke short-circuit runs immediately after set_page_config to avoid sidebar/key-gating UI.
+# IMPORTANT:
+# - Do NOT short-circuit/stop in CI, because another UI test asserts the presence of
+#   the Primary Topic input and Run Research button.
+# - Smoke mode must be enabled in GitHub Actions where CI is typically "true".
 
 import os
 import time
 from typing import Any, Dict
 
 import streamlit as st
-
-
-def _is_truthy(value: str) -> bool:
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def ci_smoke_enabled() -> bool:
-    # Robust detection for GitHub Actions + local overrides
-    return (
-        _is_truthy(os.getenv("UAPPRESS_CI_SMOKE", "")) or
-        _is_truthy(os.getenv("UAPPRESS_SMOKE", "")) or
-        _is_truthy(os.getenv("CI", "")) or
-        _is_truthy(os.getenv("GITHUB_ACTIONS", ""))
-    )
-
-
-def mark_run_done() -> None:
-    # Stable Playwright contract marker (plain text)
-    st.markdown("TEST_HOOK:RUN_DONE")
+from ci_hooks import ci_smoke_enabled, mark_run_done
 
 
 # ------------------------------------------------------------------------------
-# Page Config (must be first Streamlit call)
-# ------------------------------------------------------------------------------
-st.set_page_config(page_title="UAPpress Research Engine", layout="wide")
-
-
-# ------------------------------------------------------------------------------
-# CI Smoke Short-Circuit (NO secrets, NO network, NO clicks)
-# ------------------------------------------------------------------------------
-if ci_smoke_enabled():
-    st.title("UAPpress Research Engine")
-    st.caption("TEST_HOOK:APP_LOADED")
-    st.success("Research Complete (CI smoke)")
-    mark_run_done()
-    st.stop()
-
-
-# ------------------------------------------------------------------------------
-# Import-time safe research function (real engine optional)
+# Import-time safe research function
 # ------------------------------------------------------------------------------
 try:
-    # If/when you wire a real engine module, keep this import.
+    # Adjust to match your project if/when you wire the real engine
     from research_engine import run_research  # type: ignore
 except Exception:
     def run_research(**kwargs) -> Dict[str, Any]:
-        # Safe fallback: never crashes UI
+        # Safe placeholder: never crashes UI
         return {
             "status": "PRELIMINARY",
             "confidence_overall": 0.62,
@@ -72,9 +38,23 @@ except Exception:
 
 
 # ------------------------------------------------------------------------------
-# Normal App (non-CI mode)
+# Deterministic modes
 # ------------------------------------------------------------------------------
+# Explicit envs (optional) + robust CI detection via ci_smoke_enabled()
+SMOKE_MODE = (
+    os.getenv("UAPPRESS_SMOKE", "").strip() == "1"
+    or os.getenv("UAPPRESS_CI_SMOKE", "").strip() == "1"
+    or ci_smoke_enabled()
+)
+
+
+# ------------------------------------------------------------------------------
+# Page Config
+# ------------------------------------------------------------------------------
+st.set_page_config(page_title="UAPpress Research Engine", layout="wide")
 st.title("UAPpress Research Engine")
+
+# Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
 
 
@@ -150,13 +130,18 @@ with st.sidebar:
         max_sources = 25
         include_gov_docs = True
 
+    st.divider()
+    if SMOKE_MODE:
+        st.success("Smoke mode enabled — no API keys required.")
+        st.caption("TEST_HOOK:SMOKE_MODE")
+
 
 # ------------------------------------------------------------------------------
 # Main Page — Minimal Inputs (stable render order)
 # ------------------------------------------------------------------------------
 st.subheader("Research Topic")
 
-# Initialize session state (deterministic across reruns)
+# Initialize session state for deterministic outputs across reruns
 if "last_dossier" not in st.session_state:
     st.session_state["last_dossier"] = None
 if "last_run_ts" not in st.session_state:
@@ -165,7 +150,7 @@ if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
 
 
-# Atomic submit to prevent rerun races
+# Atomic submit to prevent rerun races that break Playwright clicks
 with st.form("research_form", clear_on_submit=False):
     primary_topic = st.text_input(
         "Primary Topic",
@@ -180,7 +165,7 @@ with st.form("research_form", clear_on_submit=False):
 
 
 # ------------------------------------------------------------------------------
-# Deterministic mock dossier (for local smoke if you ever enable UAPPRESS_SMOKE)
+# Deterministic mock dossier (CI smoke fixture)
 # ------------------------------------------------------------------------------
 def _mock_dossier(topic: str) -> Dict[str, Any]:
     return {
@@ -193,7 +178,7 @@ def _mock_dossier(topic: str) -> Dict[str, Any]:
             {"title": "Mock Source B", "url": "https://example.com/b", "score": 0.84},
             {"title": "Mock Source C", "url": "https://example.com/c", "score": 0.79},
         ],
-        "notes": ["Local smoke mode — no external calls were made."],
+        "notes": ["SMOKE_MODE enabled — no external calls were made."],
     }
 
 
@@ -209,9 +194,9 @@ if run_button:
         st.session_state["run_status"] = "ERROR"
         st.stop()
 
-    # In normal mode, require SerpAPI key
-    if not serpapi_key:
-        st.warning("SerpAPI key required.")
+    # In non-smoke mode, require SerpAPI key
+    if (not serpapi_key) and (not SMOKE_MODE):
+        st.warning("SerpAPI key required (or enable smoke mode).")
         st.session_state["run_status"] = "ERROR"
         st.stop()
 
@@ -219,15 +204,18 @@ if run_button:
     st.caption("TEST_HOOK:RUN_STARTED")
 
     try:
-        dossier = run_research(
-            primary_topic=primary_topic,
-            serpapi_key=serpapi_key,
-            openai_key=openai_key or None,
-            confidence_threshold=confidence_threshold,
-            max_serp_queries=max_serp_queries,
-            max_sources=max_sources,
-            include_gov_docs=include_gov_docs,
-        )
+        if SMOKE_MODE:
+            dossier = _mock_dossier(primary_topic)
+        else:
+            dossier = run_research(
+                primary_topic=primary_topic,
+                serpapi_key=serpapi_key,
+                openai_key=openai_key or None,
+                confidence_threshold=confidence_threshold,
+                max_serp_queries=max_serp_queries,
+                max_sources=max_sources,
+                include_gov_docs=include_gov_docs,
+            )
 
         st.session_state["last_dossier"] = dossier
         st.session_state["run_status"] = "DONE"
@@ -240,7 +228,7 @@ if run_button:
 
 
 # ------------------------------------------------------------------------------
-# Output Rendering (stable)
+# Output Rendering (stable; always renders if we have data)
 # ------------------------------------------------------------------------------
 dossier = st.session_state.get("last_dossier")
 
@@ -255,6 +243,8 @@ if dossier:
         quality = "Preliminary"
 
     st.success(f"Research Complete — Quality: {quality} ({round(score, 2)})")
+
+    # This is the marker Playwright waits for after clicking Run Research
     mark_run_done()
 
     st.subheader("Dossier Output")
