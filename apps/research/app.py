@@ -9,7 +9,7 @@ import os
 import json
 import time
 from typing import Any, Dict
-from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
+from ci_hooks import ci_smoke_enabled, mark_run_done
 
 import streamlit as st
 
