@@ -1,12 +1,40 @@
 # apps/research/app.py — UAPpress Research Engine (Production-safe + CI-deterministic)
+#
+# Goals:
+# - Imports cleanly (import-time safety)
+# - Deterministic CI smoke mode: NO secrets, NO network, NO clicks
+# - Stable Playwright hooks:
+#     TEST_HOOK:APP_LOADED
+#     TEST_HOOK:RUN_DONE
+#
+# Notes:
+# - We do NOT rely solely on CI="1". GitHub Actions typically sets CI="true" and GITHUB_ACTIONS="true".
+# - CI smoke short-circuit runs immediately after set_page_config to avoid sidebar/key-gating UI.
 
 import os
-import json
 import time
 from typing import Any, Dict
 
 import streamlit as st
-from ci_hooks import ci_smoke_enabled, mark_run_done
+
+
+def _is_truthy(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def ci_smoke_enabled() -> bool:
+    # Robust detection for GitHub Actions + local overrides
+    return (
+        _is_truthy(os.getenv("UAPPRESS_CI_SMOKE", "")) or
+        _is_truthy(os.getenv("UAPPRESS_SMOKE", "")) or
+        _is_truthy(os.getenv("CI", "")) or
+        _is_truthy(os.getenv("GITHUB_ACTIONS", ""))
+    )
+
+
+def mark_run_done() -> None:
+    # Stable Playwright contract marker (plain text)
+    st.markdown("TEST_HOOK:RUN_DONE")
 
 
 # ------------------------------------------------------------------------------
@@ -16,7 +44,7 @@ st.set_page_config(page_title="UAPpress Research Engine", layout="wide")
 
 
 # ------------------------------------------------------------------------------
-# CI Smoke Short-Circuit (NO secrets, NO clicks, NO network)
+# CI Smoke Short-Circuit (NO secrets, NO network, NO clicks)
 # ------------------------------------------------------------------------------
 if ci_smoke_enabled():
     st.title("UAPpress Research Engine")
@@ -27,12 +55,14 @@ if ci_smoke_enabled():
 
 
 # ------------------------------------------------------------------------------
-# Import-time safe research function
+# Import-time safe research function (real engine optional)
 # ------------------------------------------------------------------------------
 try:
+    # If/when you wire a real engine module, keep this import.
     from research_engine import run_research  # type: ignore
 except Exception:
     def run_research(**kwargs) -> Dict[str, Any]:
+        # Safe fallback: never crashes UI
         return {
             "status": "PRELIMINARY",
             "confidence_overall": 0.62,
@@ -49,7 +79,7 @@ st.caption("TEST_HOOK:APP_LOADED")
 
 
 # ------------------------------------------------------------------------------
-# Sidebar
+# Sidebar — Connections + Mode
 # ------------------------------------------------------------------------------
 with st.sidebar:
     st.header("Connections")
@@ -57,12 +87,14 @@ with st.sidebar:
     serpapi_key = st.text_input(
         "SerpAPI Key",
         type="password",
+        help="Bring Your Own SerpAPI key",
         key="serpapi_key_input",
     )
 
     openai_key = st.text_input(
         "OpenAI Key (optional)",
         type="password",
+        help="Optional — only required if LLM refinement is enabled",
         key="openai_key_input",
     )
 
@@ -73,10 +105,14 @@ with st.sidebar:
         "Select Mode",
         ["Simple", "Pro"],
         index=0,
+        help="Simple = optimized defaults. Pro = full control.",
         key="mode_radio",
     )
 
     if mode == "Pro":
+        st.divider()
+        st.subheader("Pro Settings")
+
         confidence_threshold = st.slider(
             "Confidence Threshold",
             0.4,
@@ -108,6 +144,7 @@ with st.sidebar:
             key="include_gov_docs_checkbox",
         )
     else:
+        # Simple mode defaults (keep stable, deterministic)
         confidence_threshold = 0.58
         max_serp_queries = 12
         max_sources = 25
@@ -115,19 +152,20 @@ with st.sidebar:
 
 
 # ------------------------------------------------------------------------------
-# Session State
+# Main Page — Minimal Inputs (stable render order)
 # ------------------------------------------------------------------------------
+st.subheader("Research Topic")
+
+# Initialize session state (deterministic across reruns)
 if "last_dossier" not in st.session_state:
     st.session_state["last_dossier"] = None
+if "last_run_ts" not in st.session_state:
+    st.session_state["last_run_ts"] = None
 if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
 
 
-# ------------------------------------------------------------------------------
-# Main Input Form
-# ------------------------------------------------------------------------------
-st.subheader("Research Topic")
-
+# Atomic submit to prevent rerun races
 with st.form("research_form", clear_on_submit=False):
     primary_topic = st.text_input(
         "Primary Topic",
@@ -142,19 +180,20 @@ with st.form("research_form", clear_on_submit=False):
 
 
 # ------------------------------------------------------------------------------
-# Deterministic Mock (used only if you manually enable smoke via env)
+# Deterministic mock dossier (for local smoke if you ever enable UAPPRESS_SMOKE)
 # ------------------------------------------------------------------------------
 def _mock_dossier(topic: str) -> Dict[str, Any]:
     return {
         "status": "COMPLETE",
         "confidence_overall": 0.82,
         "topic": topic,
-        "summary": "Mock deterministic research result.",
+        "summary": "Mock smoke mode research result (deterministic).",
         "sources": [
             {"title": "Mock Source A", "url": "https://example.com/a", "score": 0.91},
             {"title": "Mock Source B", "url": "https://example.com/b", "score": 0.84},
             {"title": "Mock Source C", "url": "https://example.com/c", "score": 0.79},
         ],
+        "notes": ["Local smoke mode — no external calls were made."],
     }
 
 
@@ -163,13 +202,17 @@ def _mock_dossier(topic: str) -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 if run_button:
     st.session_state["run_status"] = "RUNNING"
+    st.session_state["last_run_ts"] = int(time.time())
 
     if not primary_topic:
         st.warning("Please enter a topic.")
+        st.session_state["run_status"] = "ERROR"
         st.stop()
 
+    # In normal mode, require SerpAPI key
     if not serpapi_key:
         st.warning("SerpAPI key required.")
+        st.session_state["run_status"] = "ERROR"
         st.stop()
 
     st.info("Running research...")
@@ -190,13 +233,14 @@ if run_button:
         st.session_state["run_status"] = "DONE"
 
     except Exception as e:
+        st.session_state["run_status"] = "ERROR"
         st.error(f"Unexpected error: {str(e)}")
         st.caption("TEST_HOOK:RUN_ERROR")
         st.stop()
 
 
 # ------------------------------------------------------------------------------
-# Output Rendering
+# Output Rendering (stable)
 # ------------------------------------------------------------------------------
 dossier = st.session_state.get("last_dossier")
 
