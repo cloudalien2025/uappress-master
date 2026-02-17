@@ -28,10 +28,10 @@ except Exception:
 # ------------------------------------------------------------------------------
 # Import-time safe research function
 # ------------------------------------------------------------------------------
-ENGINE_IMPORT_OK = True
-
+ENGINE_IMPORT_OK = False
 try:
-    from apps.research.uappress_engine import run_research, ResearchJob  # type: ignore
+    from apps.research.uappress_engine import run_research, ResearchJob
+    ENGINE_IMPORT_OK = True
 except Exception:
     ENGINE_IMPORT_OK = False
 
@@ -51,6 +51,9 @@ except Exception:
             "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
             "job_type": _fallback_job_type(),
         }
+
+    class ResearchJob:  # type: ignore[no-redef]
+        pass
 
 
 # ------------------------------------------------------------------------------
@@ -149,7 +152,9 @@ with st.sidebar:
 
     st.divider()
     st.caption(f"ENGINE_IMPORT: {'OK' if ENGINE_IMPORT_OK else 'FALLBACK'}")
+    st.caption(f"APP_FILE: {__file__}")
 
+    st.divider()
     if SMOKE_MODE:
         st.success("Smoke mode enabled — no API keys required.")
         st.caption("TEST_HOOK:SMOKE_MODE")
