@@ -17,23 +17,61 @@ import time
 from typing import Any, Dict
 
 import streamlit as st
-from ci_hooks import ci_smoke_enabled, mark_run_done
+try:
+    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
+except Exception:
+    from ci_hooks import ci_smoke_enabled, mark_run_done
 
 
 # ------------------------------------------------------------------------------
 # Import-time safe research function
 # ------------------------------------------------------------------------------
 try:
-    # Wired implementation lives in apps/research/research_engine.py
-    from research_engine import run_research  # type: ignore
+    from apps.research.uappress_engine import ResearchJob, build_documentary_blueprint, run_research
+    ENGINE_IMPORT_MARKER = "TEST_HOOK:ENGINE_IMPORT_OK"
 except Exception:
-    def run_research(**kwargs) -> Dict[str, Any]:
+    ENGINE_IMPORT_MARKER = "TEST_HOOK:ENGINE_IMPORT_FALLBACK"
+
+    class ResearchJob:  # type: ignore
+        def __init__(
+            self,
+            primary_topic: str,
+            confidence_threshold: float = 0.58,
+            max_serp_queries: int = 12,
+            max_sources: int = 25,
+            include_gov_docs: bool = True,
+        ):
+            self.primary_topic = primary_topic
+            self.confidence_threshold = confidence_threshold
+            self.max_serp_queries = max_serp_queries
+            self.max_sources = max_sources
+            self.include_gov_docs = include_gov_docs
+
+    def run_research(job: ResearchJob, serpapi_key: str | None, openai_key: str | None = None) -> Dict[str, Any]:
         # Safe placeholder: never crashes UI
         return {
             "status": "PRELIMINARY",
             "confidence_overall": 0.62,
             "note": "run_research import not wired yet (fallback stub).",
-            "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
+            "topic": getattr(job, "primary_topic", ""),
+            "args": {
+                "serpapi_key": "***" if serpapi_key else None,
+                "openai_key": "***" if openai_key else None,
+            },
+        }
+
+    def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
+        topic = str(dossier.get("topic") or dossier.get("primary_topic") or "Untitled Topic")
+        return {
+            "title": f"{topic}: Preliminary Blueprint",
+            "logline": "Fallback blueprint used because engine import failed.",
+            "cold_open": {"vo": "Fallback mode.", "beats": ["Import fallback"]},
+            "act_1_context": {"vo": "Context unavailable.", "beats": ["Context"]},
+            "act_2_contradictions": [],
+            "act_3_implications": {"vo": "Implications unavailable.", "beats": ["Implications"]},
+            "closing_questions": ["What failed during import?"],
+            "thumbnail_angles": ["Fallback"],
+            "shorts_hooks": ["Fallback hook"],
         }
 
 
@@ -56,6 +94,7 @@ st.title("UAPpress Research Engine")
 
 # Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
+st.caption(ENGINE_IMPORT_MARKER)
 
 
 # ------------------------------------------------------------------------------
@@ -207,14 +246,17 @@ if run_button:
         if SMOKE_MODE:
             dossier = _mock_dossier(primary_topic)
         else:
-            dossier = run_research(
+            job = ResearchJob(
                 primary_topic=primary_topic,
-                serpapi_key=serpapi_key,
-                openai_key=openai_key or None,
                 confidence_threshold=confidence_threshold,
                 max_serp_queries=max_serp_queries,
                 max_sources=max_sources,
                 include_gov_docs=include_gov_docs,
+            )
+            dossier = run_research(
+                job=job,
+                serpapi_key=serpapi_key,
+                openai_key=openai_key or None,
             )
 
         st.session_state["last_dossier"] = dossier
@@ -249,6 +291,10 @@ if dossier:
 
     st.subheader("Dossier Output")
     st.json(dossier)
+
+    blueprint = build_documentary_blueprint(dossier)
+    st.subheader("Documentary Blueprint")
+    st.json(blueprint, expanded=False)
 
     sources = dossier.get("sources") or []
     if isinstance(sources, list) and sources:
