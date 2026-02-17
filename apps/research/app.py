@@ -19,11 +19,26 @@ import json
 from typing import Any, Dict
 
 import streamlit as st
-
 try:
     from ci_hooks import ci_smoke_enabled, mark_run_done
 except Exception:
-    from .ci_hooks import ci_smoke_enabled, mark_run_done
+    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
+
+try:
+    from uappress_engine import build_video_asset
+except Exception:
+    try:
+        from apps.research.uappress_engine import build_video_asset
+    except Exception:
+        def build_video_asset(**kwargs) -> Dict[str, Any]:
+            return {
+                "mode": "smoke" if kwargs.get("smoke") else "real",
+                "mp4_path": "",
+                "sha256": "",
+                "fps": 30,
+                "resolution": [1280, 720],
+                "notes": ["build_video_asset import not wired yet (fallback stub)."],
+            }
 
 
 # ------------------------------------------------------------------------------
@@ -198,8 +213,8 @@ if "last_run_ts" not in st.session_state:
     st.session_state["last_run_ts"] = None
 if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
-if "last_images" not in st.session_state:
-    st.session_state["last_images"] = None
+if "last_video" not in st.session_state:
+    st.session_state["last_video"] = None
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -326,51 +341,50 @@ if dossier:
             url = str(s.get("url", ""))
             st.markdown(f"{i}. **{title}** — {url}")
 
-    if (
-        build_documentary_blueprint is not None
-        and compile_voiceover_script is not None
-        and build_scene_plan is not None
-        and build_image_assets is not None
-    ):
-        blueprint = build_documentary_blueprint(dossier)
-        script_result = compile_voiceover_script(blueprint, target_minutes=12)
-        scene_plan = build_scene_plan(blueprint, script_result)
+    st.subheader("Video Assembly")
 
-        st.subheader("Scene Plan")
-        st.json(scene_plan)
+    image_result = st.session_state.get("last_images")
+    audio_result = st.session_state.get("last_audio")
+    subtitles_result = st.session_state.get("last_subtitles")
+    scene_plan = st.session_state.get("last_scene_plan") or {}
 
-        if st.button("Generate Images", key="generate_images_button"):
+    if st.button("Assemble Video (MP4)"):
+        if not image_result or not audio_result:
+            st.warning("Images and audio artifacts are required before assembly.")
+        else:
             try:
-                st.session_state["last_images"] = build_image_assets(
-                    scene_plan,
-                    openai_key=openai_key or None,
+                st.session_state["last_video"] = build_video_asset(
+                    image_result=image_result,
+                    audio_result=audio_result,
+                    subtitles_result=subtitles_result,
+                    scene_plan=scene_plan,
                     smoke=SMOKE_MODE,
-                    max_images=60,
                 )
+                st.success("Video assembly complete.")
             except Exception as e:
-                st.error(f"Image generation failed: {str(e)}")
+                st.error(f"Video assembly failed: {str(e)}")
 
-        image_result = st.session_state.get("last_images")
-        if image_result:
-            st.subheader("Image Assets")
-            st.write(f"image_count: {image_result.get('image_count', 0)}")
-            st.write(f"out_dir: {image_result.get('out_dir', '')}")
-            preview_images = (image_result.get("images") or [])[:3]
-            st.write("Preview (first 3):")
-            for item in preview_images:
-                st.write(f"- {item.get('path')} | {item.get('sha256')}")
+    video_result = st.session_state.get("last_video")
+    if video_result:
+        st.json(
+            {
+                "mode": video_result.get("mode"),
+                "mp4_path": video_result.get("mp4_path"),
+                "sha256": video_result.get("sha256"),
+            }
+        )
 
     bundle_payload = {
         "dossier": dossier,
-        "images": st.session_state.get("last_images"),
+        "video": video_result,
     }
     st.download_button(
-        "Download Bundle JSON",
+        "Download Bundle",
         data=json.dumps(bundle_payload, indent=2),
         file_name="uappress_bundle.json",
         mime="application/json",
-        key="download_bundle_json",
     )
+
 else:
     st.info("Enter a topic and click Run Research to generate a dossier.")
     st.caption("TEST_HOOK:EMPTY_STATE")

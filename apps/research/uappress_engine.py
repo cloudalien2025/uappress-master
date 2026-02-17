@@ -1,84 +1,50 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+import os
+from typing import Optional
 
-from apps.video.image_engine import generate_scene_images
-
-
-@dataclass
-class ResearchJob:
-    primary_topic: str
+from apps.video.assemble import assemble_video
 
 
-def run_research(
-    job: ResearchJob,
-    serpapi_key: Optional[str],
-    openai_key: Optional[str] = None,
-    progress_cb=None,
-) -> Dict[str, Any]:
-    _ = (serpapi_key, openai_key, progress_cb)
-    topic = (job.primary_topic or "Unknown topic").strip()
-    return {
-        "status": "COMPLETE",
-        "confidence_overall": 0.8,
-        "topic": topic,
-        "summary": f"Deterministic research dossier for {topic}.",
-        "sources": [
-            {"title": "Deterministic Source 1", "url": "https://example.com/source-1", "score": 0.9},
-            {"title": "Deterministic Source 2", "url": "https://example.com/source-2", "score": 0.85},
-        ],
-    }
+def _resolve_images_dir(image_result: dict) -> str:
+    if image_result.get("images_dir"):
+        return str(image_result["images_dir"])
+
+    for key in ("image_paths", "images", "scene_images"):
+        paths = image_result.get(key)
+        if isinstance(paths, list) and paths:
+            return os.path.dirname(str(paths[0])) or "."
+
+    raise ValueError("Unable to resolve images_dir from image_result")
 
 
-def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
-    topic = str(dossier.get("topic") or "Untitled Topic")
-    sections = [
-        {"section_id": 1, "label": "Context", "focus": f"Historical context around {topic}"},
-        {"section_id": 2, "label": "Evidence", "focus": f"Key evidence and witness claims for {topic}"},
-        {"section_id": 3, "label": "Analysis", "focus": f"Competing interpretations and open questions for {topic}"},
-    ]
-    return {"topic": topic, "sections": sections}
-
-
-def compile_voiceover_script(blueprint: Dict[str, Any], target_minutes: int = 12) -> Dict[str, Any]:
-    sections = blueprint.get("sections") or []
-    lines: List[str] = []
-    for section in sections:
-        lines.append(f"{section['label']}: {section['focus']}.")
-    full_text = " ".join(lines)
-    return {
-        "target_minutes": int(target_minutes),
-        "full_text": full_text,
-        "segments": [{"section_id": s["section_id"], "text": f"{s['label']}: {s['focus']}."} for s in sections],
-    }
-
-
-def build_scene_plan(blueprint: Dict[str, Any], script_result: Dict[str, Any]) -> Dict[str, Any]:
-    _ = script_result
-    scenes = []
-    for idx, section in enumerate(blueprint.get("sections") or [], start=1):
-        scenes.append(
-            {
-                "scene_id": idx,
-                "section": section.get("label"),
-                "visual_prompt": f"Cinematic documentary frame about {section.get('focus')}",
-            }
-        )
-    return {"scene_count": len(scenes), "scenes": scenes}
-
-
-def build_image_assets(
-    scene_plan: Dict[str, Any],
+def build_video_asset(
     *,
-    openai_key: Optional[str],
+    image_result: dict,
+    audio_result: dict,
+    subtitles_result: Optional[dict],
+    scene_plan: dict,
     smoke: bool,
-    max_images: int = 60,
-) -> Dict[str, Any]:
-    scenes = scene_plan.get("scenes") or []
-    return generate_scene_images(
-        scenes,
-        openai_key=openai_key,
+) -> dict:
+    images_dir = _resolve_images_dir(image_result)
+
+    mp3_path = audio_result.get("mp3_path") or audio_result.get("audio_path")
+    if not mp3_path:
+        raise ValueError("audio_result missing mp3_path")
+
+    srt_path = None
+    if subtitles_result:
+        srt_path = subtitles_result.get("srt_path")
+
+    video_result = assemble_video(
+        images_dir=str(images_dir),
+        audio_mp3_path=str(mp3_path),
+        subtitles_srt_path=str(srt_path) if srt_path else None,
         smoke=smoke,
-        max_images=max_images,
     )
+
+    if scene_plan and isinstance(scene_plan, dict):
+        scene_count = len(scene_plan.get("scenes", []) or [])
+        video_result.setdefault("notes", []).append(f"scene_plan_scenes={scene_count}")
+
+    return video_result
