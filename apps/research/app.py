@@ -19,26 +19,8 @@ import json
 from typing import Any, Dict
 
 import streamlit as st
-try:
-    from ci_hooks import ci_smoke_enabled, mark_run_done
-except Exception:
-    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
-
-try:
-    from uappress_engine import build_video_asset
-except Exception:
-    try:
-        from apps.research.uappress_engine import build_video_asset
-    except Exception:
-        def build_video_asset(**kwargs) -> Dict[str, Any]:
-            return {
-                "mode": "smoke" if kwargs.get("smoke") else "real",
-                "mp4_path": "",
-                "sha256": "",
-                "fps": 30,
-                "resolution": [1280, 720],
-                "notes": ["build_video_asset import not wired yet (fallback stub)."],
-            }
+from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
+from apps.research.uappress_engine import score_topic
 
 
 # ------------------------------------------------------------------------------
@@ -204,6 +186,50 @@ with st.sidebar:
 # ------------------------------------------------------------------------------
 # Main Page — Minimal Inputs (stable render order)
 # ------------------------------------------------------------------------------
+st.subheader("Topic Intelligence")
+
+if "last_topic_score" not in st.session_state:
+    st.session_state["last_topic_score"] = None
+
+topic_idea = st.text_input(
+    "Topic Idea",
+    placeholder="Example: Shag Harbor Incident",
+    key="topic_idea_input",
+)
+
+if st.button("Score Topic", key="score_topic_button"):
+    if not topic_idea.strip():
+        st.warning("Please enter a topic idea to score.")
+    else:
+        try:
+            st.session_state["last_topic_score"] = score_topic(
+                topic_idea,
+                serpapi_key=serpapi_key or None,
+                smoke=SMOKE_MODE,
+            )
+        except Exception as exc:
+            st.error(f"Topic scoring error: {str(exc)}")
+
+topic_score = st.session_state.get("last_topic_score")
+if topic_score:
+    recommendation = topic_score.get("recommendation", "MAYBE")
+    badge_type = {
+        "GREENLIGHT": "success",
+        "MAYBE": "warning",
+        "PASS": "error",
+    }.get(recommendation, "info")
+    getattr(st, badge_type)(f"Recommendation: {recommendation}")
+    st.json(topic_score)
+
+if st.button("Use as Primary Topic", key="use_as_primary_topic_button"):
+    if topic_idea.strip():
+        st.session_state["primary_topic_input"] = topic_idea
+        st.success("Primary Topic updated from Topic Idea.")
+    else:
+        st.warning("Enter a Topic Idea first.")
+
+st.caption("Topic scoring ready")
+
 st.subheader("Research Topic")
 
 # Initialize session state for deterministic outputs across reruns
