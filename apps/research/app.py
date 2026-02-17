@@ -12,6 +12,7 @@
 #   the Primary Topic input and Run Research button.
 # - Smoke mode must be enabled in GitHub Actions where CI is typically "true".
 
+import json
 import os
 import time
 import json
@@ -82,6 +83,7 @@ st.title("UAPpress Research Engine")
 
 # Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
+st.caption(ENGINE_IMPORT_MARKER)
 
 
 # ------------------------------------------------------------------------------
@@ -290,6 +292,29 @@ if dossier:
 
     st.subheader("Dossier Output")
     st.json(dossier)
+
+    blueprint = build_documentary_blueprint(dossier)
+    script_result = compile_voiceover_script(blueprint, target_minutes=12)
+    scene_plan = build_scene_plan(blueprint, script_result, target_scene_seconds=6.0, max_scenes=180)
+
+    st.subheader("Voiceover Script")
+    st.json(script_result)
+
+    st.subheader("Scene Plan")
+    st.json(scene_plan)
+
+    bundle = {
+        "dossier": dossier,
+        "blueprint": blueprint,
+        "script": script_result,
+        "scene_plan": scene_plan,
+    }
+    st.download_button(
+        "Download Bundle (JSON)",
+        data=json.dumps(bundle, sort_keys=True, indent=2),
+        file_name="uappress_bundle.json",
+        mime="application/json",
+    )
 
     sources = dossier.get("sources") or []
     if isinstance(sources, list) and sources:
