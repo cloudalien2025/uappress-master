@@ -1,1 +1,1 @@
-"""Research app package marker for absolute imports."""
+"""Research app package."""

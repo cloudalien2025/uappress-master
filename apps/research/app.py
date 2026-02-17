@@ -30,8 +30,7 @@ except Exception:
 # ------------------------------------------------------------------------------
 ENGINE_IMPORT_OK = False
 try:
-    from apps.research.uappress_engine import run_research, ResearchJob
-    ENGINE_IMPORT_OK = True
+    from apps.research.uappress_engine_v9 import run_research  # type: ignore
 except Exception:
     ENGINE_IMPORT_OK = False
 
@@ -72,6 +71,7 @@ SMOKE_MODE = (
 # ------------------------------------------------------------------------------
 st.set_page_config(page_title="UAPpress Research Engine", layout="wide")
 st.title("UAPpress Research Engine")
+st.caption("DEPLOY_STAMP: 2026-02-17-B")
 
 # Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
