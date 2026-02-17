@@ -20,9 +20,27 @@ from typing import Any, Dict
 
 import streamlit as st
 try:
-    from ci_hooks import ci_smoke_enabled, mark_run_done
+    from .ci_hooks import ci_smoke_enabled, mark_run_done
 except Exception:
-    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
+    from ci_hooks import ci_smoke_enabled, mark_run_done
+
+try:
+    from .uappress_engine import (  # type: ignore
+        build_documentary_blueprint,
+        build_subtitles_asset,
+        compile_voiceover_script,
+    )
+except Exception:
+    try:
+        from uappress_engine import (  # type: ignore
+            build_documentary_blueprint,
+            build_subtitles_asset,
+            compile_voiceover_script,
+        )
+    except Exception:
+        build_documentary_blueprint = None
+        compile_voiceover_script = None
+        build_subtitles_asset = None
 
 
 # ------------------------------------------------------------------------------
@@ -176,14 +194,12 @@ if "last_run_ts" not in st.session_state:
     st.session_state["last_run_ts"] = None
 if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
-if "last_blueprint" not in st.session_state:
-    st.session_state["last_blueprint"] = None
-if "last_script" not in st.session_state:
-    st.session_state["last_script"] = None
-if "last_scene_plan" not in st.session_state:
-    st.session_state["last_scene_plan"] = None
-if "last_audio" not in st.session_state:
-    st.session_state["last_audio"] = None
+if "last_script_result" not in st.session_state:
+    st.session_state["last_script_result"] = None
+if "last_audio_result" not in st.session_state:
+    st.session_state["last_audio_result"] = None
+if "last_subtitles" not in st.session_state:
+    st.session_state["last_subtitles"] = None
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -293,28 +309,13 @@ if dossier:
     st.subheader("Dossier Output")
     st.json(dossier)
 
-    blueprint = build_documentary_blueprint(dossier)
-    script_result = compile_voiceover_script(blueprint, target_minutes=12)
-    scene_plan = build_scene_plan(blueprint, script_result, target_scene_seconds=6.0, max_scenes=180)
-
-    st.subheader("Voiceover Script")
-    st.json(script_result)
-
-    st.subheader("Scene Plan")
-    st.json(scene_plan)
-
-    bundle = {
-        "dossier": dossier,
-        "blueprint": blueprint,
-        "script": script_result,
-        "scene_plan": scene_plan,
-    }
-    st.download_button(
-        "Download Bundle (JSON)",
-        data=json.dumps(bundle, sort_keys=True, indent=2),
-        file_name="uappress_bundle.json",
-        mime="application/json",
-    )
+    if (
+        st.session_state.get("last_script_result") is None
+        and build_documentary_blueprint is not None
+        and compile_voiceover_script is not None
+    ):
+        blueprint = build_documentary_blueprint(dossier)
+        st.session_state["last_script_result"] = compile_voiceover_script(blueprint)
 
     sources = dossier.get("sources") or []
     if isinstance(sources, list) and sources:
@@ -324,45 +325,44 @@ if dossier:
             url = str(s.get("url", ""))
             st.markdown(f"{i}. **{title}** — {url}")
 
-    if blueprint:
-        st.subheader("Documentary Blueprint")
-        st.json(blueprint)
-
-    if script_result:
-        st.subheader("Voiceover Script")
-        st.json(script_result)
-
-    if scene_plan:
-        st.subheader("Scene Plan")
-        st.json(scene_plan)
-
-    if st.button("Generate Audio (MP3)", key="generate_audio_button", use_container_width=True):
-        try:
-            audio_result = build_audio_asset(
-                script_result or {"full_text": ""},
-                openai_key=openai_key or None,
+    st.subheader("Subtitles (SRT)")
+    if st.button("Generate Subtitles (SRT)", key="generate_subtitles_btn"):
+        script_result = st.session_state.get("last_script_result")
+        if not script_result:
+            st.warning("Voiceover script required before generating subtitles.")
+        elif build_subtitles_asset is None:
+            st.warning("Subtitles engine unavailable in this environment.")
+        else:
+            audio_result = st.session_state.get("last_audio_result") or {}
+            subtitles = build_subtitles_asset(
+                script_result,
+                audio_result=audio_result,
                 smoke=SMOKE_MODE,
             )
-            st.session_state["last_audio"] = audio_result
-        except Exception as e:
-            st.error(f"Audio generation failed: {str(e)}")
+            st.session_state["last_subtitles"] = subtitles
 
-    st.subheader("Audio Asset")
-    st.json(st.session_state.get("last_audio"))
+    subtitles = st.session_state.get("last_subtitles")
+    if subtitles:
+        st.json(
+            {
+                "srt_path": subtitles.get("srt_path"),
+                "caption_count": subtitles.get("caption_count"),
+                "sha256": subtitles.get("sha256"),
+            }
+        )
 
     bundle = {
         "dossier": dossier,
-        "blueprint": blueprint,
-        "script": script_result,
-        "scene_plan": scene_plan,
-        "audio": st.session_state.get("last_audio"),
+        "script": st.session_state.get("last_script_result"),
+        "audio": st.session_state.get("last_audio_result"),
+        "subtitles": st.session_state.get("last_subtitles"),
     }
     st.download_button(
-        "Download Audio Bundle",
+        "Download Bundle JSON",
         data=json.dumps(bundle, indent=2),
-        file_name="uappress_audio_bundle.json",
+        file_name="uappress_bundle.json",
         mime="application/json",
-        key="download_audio_bundle_button",
+        key="download_bundle_btn",
     )
 
 else:

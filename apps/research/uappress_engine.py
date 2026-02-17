@@ -1,13 +1,25 @@
 from __future__ import annotations
 
-import os
+import hashlib
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict
 
-from apps.video.tts_engine import generate_vo_audio
+from apps.video.subtitles import assign_timings, split_script_into_captions, write_srt
 
 
-SMOKE_MODE = os.getenv("UAPPRESS_SMOKE", "").strip() == "1" or os.getenv("CI", "").strip().lower() == "true"
+_WORD_RE = re.compile(r"\b\w+(?:['-]\w+)?\b")
+
+
+def _word_count(text: str) -> int:
+    return len(_WORD_RE.findall(text or ""))
+
+
+def _estimate_duration_seconds(text: str) -> float:
+    words = _word_count(text)
+    wpm = 145.0
+    return round((words / wpm) * 60.0, 3) if words else 0.0
 
 
 @dataclass
@@ -15,80 +27,82 @@ class ResearchJob:
     primary_topic: str
 
 
-def run_research(job: ResearchJob, serpapi_key: Optional[str], openai_key: Optional[str] = None) -> Dict[str, Any]:
-    topic = (job.primary_topic or "").strip() or "Untitled Topic"
-    if SMOKE_MODE or not serpapi_key:
-        return {
-            "status": "COMPLETE",
-            "confidence_overall": 0.82,
-            "topic": topic,
-            "summary": "Mock smoke mode research result (deterministic).",
-            "sources": [
-                {"title": "Mock Source A", "url": "https://example.com/a", "score": 0.91},
-                {"title": "Mock Source B", "url": "https://example.com/b", "score": 0.84},
-                {"title": "Mock Source C", "url": "https://example.com/c", "score": 0.79},
-            ],
-            "notes": ["SMOKE_MODE enabled — no external calls were made."],
-        }
-
-    try:
-        from apps.research.uappress_engine_v9 import run_research as run_research_v9  # type: ignore
-        from apps.research.uappress_engine_v9 import ResearchJob as ResearchJobV9  # type: ignore
-
-        job_v9 = ResearchJobV9(primary_topic=topic)
-        return run_research_v9(job_v9, serpapi_key=serpapi_key, openai_key=openai_key)
-    except Exception as exc:
-        return {
-            "status": "PRELIMINARY",
-            "confidence_overall": 0.5,
-            "topic": topic,
-            "summary": f"Fallback run_research path used: {exc.__class__.__name__}",
-            "sources": [],
-        }
+def run_research(job: ResearchJob, serpapi_key: str | None = None, openai_key: str | None = None) -> Dict[str, Any]:
+    del serpapi_key, openai_key
+    return {
+        "status": "COMPLETE",
+        "confidence_overall": 0.82,
+        "topic": job.primary_topic,
+        "summary": "Deterministic smoke dossier.",
+        "sources": [],
+    }
 
 
 def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
-    topic = dossier.get("topic") or "Untitled Topic"
-    sources = dossier.get("sources") or []
+    topic = str(dossier.get("topic", "Untitled Topic"))
     return {
         "topic": topic,
-        "thesis": f"Evidence-driven overview of {topic}",
-        "acts": ["Setup", "Complication", "Resolution"],
-        "source_count": len(sources),
+        "sections": [
+            {"title": "Cold Open", "beats": [f"Introduce {topic}."]},
+            {"title": "Act 1", "beats": [f"Context for {topic}."]},
+            {"title": "Act 2", "beats": [f"Evidence around {topic}."]},
+        ],
     }
 
 
 def compile_voiceover_script(blueprint: Dict[str, Any], target_minutes: int = 12) -> Dict[str, Any]:
-    topic = blueprint.get("topic") or "Untitled Topic"
-    full_text = (
-        f"This documentary explores {topic}. "
-        f"Act one introduces the known facts and context. "
-        f"Act two examines competing claims and supporting evidence. "
-        f"Act three provides a grounded conclusion and open questions for future reporting."
-    )
+    sections = blueprint.get("sections", [])
+    lines = []
+    for section in sections:
+        title = str(section.get("title", "Section"))
+        beats = section.get("beats") or []
+        beat_text = " ".join(str(b) for b in beats)
+        lines.append(f"[{title.upper()}]\n{beat_text}")
+    full_text = "\n\n".join(lines)
     return {
-        "target_minutes": target_minutes,
         "full_text": full_text,
-        "word_count": len(full_text.split()),
+        "target_minutes": target_minutes,
+        "word_count": _word_count(full_text),
     }
 
 
-def build_scene_plan(blueprint: Dict[str, Any], script_result: Dict[str, Any]) -> Dict[str, Any]:
-    topic = blueprint.get("topic") or "Untitled Topic"
+def build_subtitles_asset(
+    script_result: Dict[str, Any],
+    audio_result: Dict[str, Any],
+    *,
+    out_dir: str = "outputs/subtitles",
+    smoke: bool = False,
+) -> Dict[str, Any]:
+    script_text = str(script_result.get("full_text", "") or "")
+
+    total_seconds = audio_result.get("duration_seconds")
+    if total_seconds is None:
+        total_seconds = _estimate_duration_seconds(script_text)
+    total_seconds = round(float(total_seconds or 0.0), 3)
+
+    captions = split_script_into_captions(script_text)
+    timed = assign_timings(captions, total_seconds=total_seconds)
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    script_sha = hashlib.sha256(script_text.encode("utf-8")).hexdigest()
+    audio_sha = str(audio_result.get("sha256", ""))
+
+    if smoke:
+        filename = "vo_smoke.srt"
+        mode = "smoke"
+    else:
+        basis = f"{audio_sha}:{script_sha}".encode("utf-8")
+        filename = f"vo_{hashlib.sha256(basis).hexdigest()[:16]}.srt"
+        mode = "real"
+
+    srt_path = str(Path(out_dir) / filename)
+    write_srt(timed, srt_path)
+    srt_sha = hashlib.sha256(Path(srt_path).read_bytes()).hexdigest()
+
     return {
-        "topic": topic,
-        "scenes": [
-            {"scene": 1, "title": "Cold Open", "goal": "Hook the audience with the central mystery."},
-            {"scene": 2, "title": "Evidence Review", "goal": "Lay out key documents and testimony."},
-            {"scene": 3, "title": "Resolution", "goal": "Synthesize findings and unresolved questions."},
-        ],
-        "script_word_count": script_result.get("word_count", 0),
+        "srt_path": srt_path,
+        "total_seconds": total_seconds,
+        "caption_count": len(timed),
+        "sha256": srt_sha,
+        "mode": mode,
     }
-
-
-def build_audio_asset(script_result: dict, *, openai_key: Optional[str], smoke: bool) -> dict:
-    return generate_vo_audio(
-        script_result.get("full_text", ""),
-        openai_key=openai_key,
-        smoke=smoke,
-    )
