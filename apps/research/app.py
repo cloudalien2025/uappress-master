@@ -15,42 +15,34 @@
 import json
 import os
 import time
+import json
 from typing import Any, Dict
 
 import streamlit as st
-
 try:
-    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
-except Exception:
     from ci_hooks import ci_smoke_enabled, mark_run_done
+except Exception:
+    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
 
 
 # ------------------------------------------------------------------------------
 # Import-time safe research function
 # ------------------------------------------------------------------------------
 try:
-    try:
-        from apps.research.uappress_engine import (  # type: ignore
-            ResearchJob,
-            build_documentary_blueprint,
-            build_scene_plan,
-            compile_voiceover_script,
-            run_research,
-        )
-    except Exception:
-        from uappress_engine import (  # type: ignore
-            ResearchJob,
-            build_documentary_blueprint,
-            build_scene_plan,
-            compile_voiceover_script,
-            run_research,
-        )
+    from apps.research.uappress_engine import (  # type: ignore
+        ResearchJob,
+        run_research,
+        build_documentary_blueprint,
+        compile_voiceover_script,
+        build_scene_plan,
+        build_audio_asset,
+    )
 except Exception:
-    class ResearchJob:
+    class ResearchJob:  # type: ignore
         def __init__(self, primary_topic: str):
             self.primary_topic = primary_topic
 
-    def run_research(**kwargs) -> Dict[str, Any]:
+    def run_research(*args, **kwargs) -> Dict[str, Any]:
         # Safe placeholder: never crashes UI
         return {
             "status": "PRELIMINARY",
@@ -60,21 +52,16 @@ except Exception:
         }
 
     def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
-        topic = str(dossier.get("topic") or "Unknown topic")
-        return {"title": topic, "topic": topic}
+        return {"topic": dossier.get("topic", "Unknown"), "acts": ["Setup", "Complication", "Resolution"]}
 
-    def compile_voiceover_script(blueprint: Dict[str, Any], *, target_minutes: int = 12) -> Dict[str, Any]:
-        topic = str(blueprint.get("title") or blueprint.get("topic") or "Unknown topic")
-        return {"target_minutes": target_minutes, "title": topic, "full_text": "[ACT 1]\nFallback script."}
+    def compile_voiceover_script(blueprint: Dict[str, Any], target_minutes: int = 12) -> Dict[str, Any]:
+        return {"target_minutes": target_minutes, "full_text": f"Voiceover script for {blueprint.get('topic', 'Unknown')}"}
 
-    def build_scene_plan(
-        blueprint: Dict[str, Any],
-        script_result: Dict[str, Any],
-        *,
-        target_scene_seconds: float = 6.0,
-        max_scenes: int = 180,
-    ) -> Dict[str, Any]:
-        return {"target_scene_seconds": target_scene_seconds, "scenes": [], "estimated_total_seconds": 0.0}
+    def build_scene_plan(blueprint: Dict[str, Any], script_result: Dict[str, Any]) -> Dict[str, Any]:
+        return {"topic": blueprint.get("topic", "Unknown"), "scenes": []}
+
+    def build_audio_asset(script_result: dict, *, openai_key: str | None, smoke: bool) -> dict:
+        return {"mode": "smoke" if smoke else "real", "mp3_path": "", "duration_seconds": 0.0, "voice": "onyx", "model": "gpt-4o-mini-tts", "sha256": ""}
 
 
 # ------------------------------------------------------------------------------
@@ -189,6 +176,14 @@ if "last_run_ts" not in st.session_state:
     st.session_state["last_run_ts"] = None
 if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
+if "last_blueprint" not in st.session_state:
+    st.session_state["last_blueprint"] = None
+if "last_script" not in st.session_state:
+    st.session_state["last_script"] = None
+if "last_scene_plan" not in st.session_state:
+    st.session_state["last_scene_plan"] = None
+if "last_audio" not in st.session_state:
+    st.session_state["last_audio"] = None
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -249,12 +244,20 @@ if run_button:
             dossier = _mock_dossier(primary_topic)
         else:
             dossier = run_research(
-                job=ResearchJob(primary_topic=primary_topic),
+                ResearchJob(primary_topic=primary_topic),
                 serpapi_key=serpapi_key,
                 openai_key=openai_key or None,
             )
 
+        blueprint = build_documentary_blueprint(dossier)
+        script_result = compile_voiceover_script(blueprint)
+        scene_plan = build_scene_plan(blueprint, script_result)
+
         st.session_state["last_dossier"] = dossier
+        st.session_state["last_blueprint"] = blueprint
+        st.session_state["last_script"] = script_result
+        st.session_state["last_scene_plan"] = scene_plan
+        st.session_state["last_audio"] = None
         st.session_state["run_status"] = "DONE"
 
     except Exception as e:
@@ -268,6 +271,9 @@ if run_button:
 # Output Rendering (stable; always renders if we have data)
 # ------------------------------------------------------------------------------
 dossier = st.session_state.get("last_dossier")
+blueprint = st.session_state.get("last_blueprint")
+script_result = st.session_state.get("last_script")
+scene_plan = st.session_state.get("last_scene_plan")
 
 if dossier:
     score = float(dossier.get("confidence_overall", 0) or 0)
@@ -317,6 +323,47 @@ if dossier:
             title = str(s.get("title", f"Source {i}"))
             url = str(s.get("url", ""))
             st.markdown(f"{i}. **{title}** — {url}")
+
+    if blueprint:
+        st.subheader("Documentary Blueprint")
+        st.json(blueprint)
+
+    if script_result:
+        st.subheader("Voiceover Script")
+        st.json(script_result)
+
+    if scene_plan:
+        st.subheader("Scene Plan")
+        st.json(scene_plan)
+
+    if st.button("Generate Audio (MP3)", key="generate_audio_button", use_container_width=True):
+        try:
+            audio_result = build_audio_asset(
+                script_result or {"full_text": ""},
+                openai_key=openai_key or None,
+                smoke=SMOKE_MODE,
+            )
+            st.session_state["last_audio"] = audio_result
+        except Exception as e:
+            st.error(f"Audio generation failed: {str(e)}")
+
+    st.subheader("Audio Asset")
+    st.json(st.session_state.get("last_audio"))
+
+    bundle = {
+        "dossier": dossier,
+        "blueprint": blueprint,
+        "script": script_result,
+        "scene_plan": scene_plan,
+        "audio": st.session_state.get("last_audio"),
+    }
+    st.download_button(
+        "Download Audio Bundle",
+        data=json.dumps(bundle, indent=2),
+        file_name="uappress_audio_bundle.json",
+        mime="application/json",
+        key="download_audio_bundle_button",
+    )
 
 else:
     st.info("Enter a topic and click Run Research to generate a dossier.")
