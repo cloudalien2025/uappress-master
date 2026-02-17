@@ -12,12 +12,17 @@
 #   the Primary Topic input and Run Research button.
 # - Smoke mode must be enabled in GitHub Actions where CI is typically "true".
 
+import json
 import os
 import time
 from typing import Any, Dict
 
 import streamlit as st
-from ci_hooks import ci_smoke_enabled, mark_run_done
+
+try:
+    from ci_hooks import ci_smoke_enabled, mark_run_done
+except Exception:
+    from .ci_hooks import ci_smoke_enabled, mark_run_done
 
 
 # ------------------------------------------------------------------------------
@@ -27,14 +32,39 @@ try:
     # Adjust to match your project if/when you wire the real engine
     from research_engine import run_research  # type: ignore
 except Exception:
-    def run_research(**kwargs) -> Dict[str, Any]:
-        # Safe placeholder: never crashes UI
-        return {
-            "status": "PRELIMINARY",
-            "confidence_overall": 0.62,
-            "note": "run_research import not wired yet (fallback stub).",
-            "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
-        }
+    try:
+        from .research_engine import run_research  # type: ignore
+    except Exception:
+        def run_research(**kwargs) -> Dict[str, Any]:
+            # Safe placeholder: never crashes UI
+            return {
+                "status": "PRELIMINARY",
+                "confidence_overall": 0.62,
+                "note": "run_research import not wired yet (fallback stub).",
+                "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
+            }
+
+
+try:
+    from uappress_engine import (
+        build_documentary_blueprint,
+        build_image_assets,
+        build_scene_plan,
+        compile_voiceover_script,
+    )
+except Exception:
+    try:
+        from .uappress_engine import (
+            build_documentary_blueprint,
+            build_image_assets,
+            build_scene_plan,
+            compile_voiceover_script,
+        )
+    except Exception:
+        build_documentary_blueprint = None
+        compile_voiceover_script = None
+        build_scene_plan = None
+        build_image_assets = None
 
 
 # ------------------------------------------------------------------------------
@@ -148,6 +178,8 @@ if "last_run_ts" not in st.session_state:
     st.session_state["last_run_ts"] = None
 if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
+if "last_images" not in st.session_state:
+    st.session_state["last_images"] = None
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -188,6 +220,7 @@ def _mock_dossier(topic: str) -> Dict[str, Any]:
 if run_button:
     st.session_state["run_status"] = "RUNNING"
     st.session_state["last_run_ts"] = int(time.time())
+    st.session_state["last_images"] = None
 
     if not primary_topic:
         st.warning("Please enter a topic.")
@@ -258,6 +291,51 @@ if dossier:
             url = str(s.get("url", ""))
             st.markdown(f"{i}. **{title}** — {url}")
 
+    if (
+        build_documentary_blueprint is not None
+        and compile_voiceover_script is not None
+        and build_scene_plan is not None
+        and build_image_assets is not None
+    ):
+        blueprint = build_documentary_blueprint(dossier)
+        script_result = compile_voiceover_script(blueprint, target_minutes=12)
+        scene_plan = build_scene_plan(blueprint, script_result)
+
+        st.subheader("Scene Plan")
+        st.json(scene_plan)
+
+        if st.button("Generate Images", key="generate_images_button"):
+            try:
+                st.session_state["last_images"] = build_image_assets(
+                    scene_plan,
+                    openai_key=openai_key or None,
+                    smoke=SMOKE_MODE,
+                    max_images=60,
+                )
+            except Exception as e:
+                st.error(f"Image generation failed: {str(e)}")
+
+        image_result = st.session_state.get("last_images")
+        if image_result:
+            st.subheader("Image Assets")
+            st.write(f"image_count: {image_result.get('image_count', 0)}")
+            st.write(f"out_dir: {image_result.get('out_dir', '')}")
+            preview_images = (image_result.get("images") or [])[:3]
+            st.write("Preview (first 3):")
+            for item in preview_images:
+                st.write(f"- {item.get('path')} | {item.get('sha256')}")
+
+    bundle_payload = {
+        "dossier": dossier,
+        "images": st.session_state.get("last_images"),
+    }
+    st.download_button(
+        "Download Bundle JSON",
+        data=json.dumps(bundle_payload, indent=2),
+        file_name="uappress_bundle.json",
+        mime="application/json",
+        key="download_bundle_json",
+    )
 else:
     st.info("Enter a topic and click Run Research to generate a dossier.")
     st.caption("TEST_HOOK:EMPTY_STATE")
