@@ -73,6 +73,9 @@ st.set_page_config(page_title="UAPpress Research Engine", layout="wide")
 st.title("UAPpress Research Engine")
 st.caption("DEPLOY_STAMP: 2026-02-17-B")
 
+ui_version = os.getenv("UAPPRESS_UI_VERSION", "dev-local").strip() or "dev-local"
+st.caption(f"UI Version: {ui_version}")
+
 # Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
 st.caption(ENGINE_IMPORT_MARKER)
