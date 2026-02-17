@@ -12,8 +12,10 @@
 #   the Primary Topic input and Run Research button.
 # - Smoke mode must be enabled in GitHub Actions where CI is typically "true".
 
+import json
 import os
 import time
+import json
 from typing import Any, Dict
 
 import streamlit as st
@@ -31,6 +33,15 @@ try:
     from apps.research.uappress_engine import run_research, ResearchJob
     ENGINE_IMPORT_OK = True
 except Exception:
+    ENGINE_IMPORT_OK = False
+
+    @st.cache_data(show_spinner=False)
+    def _fallback_job_type() -> str:
+        return "fallback"
+
+    class ResearchJob:  # type: ignore
+        pass
+
     def run_research(**kwargs) -> Dict[str, Any]:
         # Safe placeholder: never crashes UI
         return {
@@ -38,6 +49,7 @@ except Exception:
             "confidence_overall": 0.62,
             "note": "run_research import not wired yet (fallback stub).",
             "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
+            "job_type": _fallback_job_type(),
         }
 
     class ResearchJob:  # type: ignore[no-redef]
@@ -63,6 +75,7 @@ st.title("UAPpress Research Engine")
 
 # Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
+st.caption(ENGINE_IMPORT_MARKER)
 
 
 # ------------------------------------------------------------------------------
@@ -150,6 +163,50 @@ with st.sidebar:
 # ------------------------------------------------------------------------------
 # Main Page — Minimal Inputs (stable render order)
 # ------------------------------------------------------------------------------
+st.subheader("Topic Intelligence")
+
+if "last_topic_score" not in st.session_state:
+    st.session_state["last_topic_score"] = None
+
+topic_idea = st.text_input(
+    "Topic Idea",
+    placeholder="Example: Shag Harbor Incident",
+    key="topic_idea_input",
+)
+
+if st.button("Score Topic", key="score_topic_button"):
+    if not topic_idea.strip():
+        st.warning("Please enter a topic idea to score.")
+    else:
+        try:
+            st.session_state["last_topic_score"] = score_topic(
+                topic_idea,
+                serpapi_key=serpapi_key or None,
+                smoke=SMOKE_MODE,
+            )
+        except Exception as exc:
+            st.error(f"Topic scoring error: {str(exc)}")
+
+topic_score = st.session_state.get("last_topic_score")
+if topic_score:
+    recommendation = topic_score.get("recommendation", "MAYBE")
+    badge_type = {
+        "GREENLIGHT": "success",
+        "MAYBE": "warning",
+        "PASS": "error",
+    }.get(recommendation, "info")
+    getattr(st, badge_type)(f"Recommendation: {recommendation}")
+    st.json(topic_score)
+
+if st.button("Use as Primary Topic", key="use_as_primary_topic_button"):
+    if topic_idea.strip():
+        st.session_state["primary_topic_input"] = topic_idea
+        st.success("Primary Topic updated from Topic Idea.")
+    else:
+        st.warning("Enter a Topic Idea first.")
+
+st.caption("Topic scoring ready")
+
 st.subheader("Research Topic")
 
 # Initialize session state for deterministic outputs across reruns
@@ -159,6 +216,8 @@ if "last_run_ts" not in st.session_state:
     st.session_state["last_run_ts"] = None
 if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
+if "last_video" not in st.session_state:
+    st.session_state["last_video"] = None
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -199,6 +258,7 @@ def _mock_dossier(topic: str) -> Dict[str, Any]:
 if run_button:
     st.session_state["run_status"] = "RUNNING"
     st.session_state["last_run_ts"] = int(time.time())
+    st.session_state["last_images"] = None
 
     if not primary_topic:
         st.warning("Please enter a topic.")
@@ -219,16 +279,20 @@ if run_button:
             dossier = _mock_dossier(primary_topic)
         else:
             dossier = run_research(
-                primary_topic=primary_topic,
+                ResearchJob(primary_topic=primary_topic),
                 serpapi_key=serpapi_key,
                 openai_key=openai_key or None,
-                confidence_threshold=confidence_threshold,
-                max_serp_queries=max_serp_queries,
-                max_sources=max_sources,
-                include_gov_docs=include_gov_docs,
             )
 
+        blueprint = build_documentary_blueprint(dossier)
+        script_result = compile_voiceover_script(blueprint)
+        scene_plan = build_scene_plan(blueprint, script_result)
+
         st.session_state["last_dossier"] = dossier
+        st.session_state["last_blueprint"] = blueprint
+        st.session_state["last_script"] = script_result
+        st.session_state["last_scene_plan"] = scene_plan
+        st.session_state["last_audio"] = None
         st.session_state["run_status"] = "DONE"
 
     except Exception as e:
@@ -242,6 +306,9 @@ if run_button:
 # Output Rendering (stable; always renders if we have data)
 # ------------------------------------------------------------------------------
 dossier = st.session_state.get("last_dossier")
+blueprint = st.session_state.get("last_blueprint")
+script_result = st.session_state.get("last_script")
+scene_plan = st.session_state.get("last_scene_plan")
 
 if dossier:
     score = float(dossier.get("confidence_overall", 0) or 0)
@@ -261,6 +328,14 @@ if dossier:
     st.subheader("Dossier Output")
     st.json(dossier)
 
+    if (
+        st.session_state.get("last_script_result") is None
+        and build_documentary_blueprint is not None
+        and compile_voiceover_script is not None
+    ):
+        blueprint = build_documentary_blueprint(dossier)
+        st.session_state["last_script_result"] = compile_voiceover_script(blueprint)
+
     sources = dossier.get("sources") or []
     if isinstance(sources, list) and sources:
         st.subheader("Top Sources")
@@ -268,6 +343,50 @@ if dossier:
             title = str(s.get("title", f"Source {i}"))
             url = str(s.get("url", ""))
             st.markdown(f"{i}. **{title}** — {url}")
+
+    st.subheader("Video Assembly")
+
+    image_result = st.session_state.get("last_images")
+    audio_result = st.session_state.get("last_audio")
+    subtitles_result = st.session_state.get("last_subtitles")
+    scene_plan = st.session_state.get("last_scene_plan") or {}
+
+    if st.button("Assemble Video (MP4)"):
+        if not image_result or not audio_result:
+            st.warning("Images and audio artifacts are required before assembly.")
+        else:
+            try:
+                st.session_state["last_video"] = build_video_asset(
+                    image_result=image_result,
+                    audio_result=audio_result,
+                    subtitles_result=subtitles_result,
+                    scene_plan=scene_plan,
+                    smoke=SMOKE_MODE,
+                )
+                st.success("Video assembly complete.")
+            except Exception as e:
+                st.error(f"Video assembly failed: {str(e)}")
+
+    video_result = st.session_state.get("last_video")
+    if video_result:
+        st.json(
+            {
+                "mode": video_result.get("mode"),
+                "mp4_path": video_result.get("mp4_path"),
+                "sha256": video_result.get("sha256"),
+            }
+        )
+
+    bundle_payload = {
+        "dossier": dossier,
+        "video": video_result,
+    }
+    st.download_button(
+        "Download Bundle",
+        data=json.dumps(bundle_payload, indent=2),
+        file_name="uappress_bundle.json",
+        mime="application/json",
+    )
 
 else:
     st.info("Enter a topic and click Run Research to generate a dossier.")
