@@ -1,25 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
-from apps.video.subtitles import assign_timings, split_script_into_captions, write_srt
-
-
-_WORD_RE = re.compile(r"\b\w+(?:['-]\w+)?\b")
-
-
-def _word_count(text: str) -> int:
-    return len(_WORD_RE.findall(text or ""))
-
-
-def _estimate_duration_seconds(text: str) -> float:
-    words = _word_count(text)
-    wpm = 145.0
-    return round((words / wpm) * 60.0, 3) if words else 0.0
+from apps.video.image_engine import generate_scene_images
 
 
 @dataclass
@@ -27,82 +11,74 @@ class ResearchJob:
     primary_topic: str
 
 
-def run_research(job: ResearchJob, serpapi_key: str | None = None, openai_key: str | None = None) -> Dict[str, Any]:
-    del serpapi_key, openai_key
+def run_research(
+    job: ResearchJob,
+    serpapi_key: Optional[str],
+    openai_key: Optional[str] = None,
+    progress_cb=None,
+) -> Dict[str, Any]:
+    _ = (serpapi_key, openai_key, progress_cb)
+    topic = (job.primary_topic or "Unknown topic").strip()
     return {
         "status": "COMPLETE",
-        "confidence_overall": 0.82,
-        "topic": job.primary_topic,
-        "summary": "Deterministic smoke dossier.",
-        "sources": [],
-    }
-
-
-def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
-    topic = str(dossier.get("topic", "Untitled Topic"))
-    return {
+        "confidence_overall": 0.8,
         "topic": topic,
-        "sections": [
-            {"title": "Cold Open", "beats": [f"Introduce {topic}."]},
-            {"title": "Act 1", "beats": [f"Context for {topic}."]},
-            {"title": "Act 2", "beats": [f"Evidence around {topic}."]},
+        "summary": f"Deterministic research dossier for {topic}.",
+        "sources": [
+            {"title": "Deterministic Source 1", "url": "https://example.com/source-1", "score": 0.9},
+            {"title": "Deterministic Source 2", "url": "https://example.com/source-2", "score": 0.85},
         ],
     }
 
 
+def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
+    topic = str(dossier.get("topic") or "Untitled Topic")
+    sections = [
+        {"section_id": 1, "label": "Context", "focus": f"Historical context around {topic}"},
+        {"section_id": 2, "label": "Evidence", "focus": f"Key evidence and witness claims for {topic}"},
+        {"section_id": 3, "label": "Analysis", "focus": f"Competing interpretations and open questions for {topic}"},
+    ]
+    return {"topic": topic, "sections": sections}
+
+
 def compile_voiceover_script(blueprint: Dict[str, Any], target_minutes: int = 12) -> Dict[str, Any]:
-    sections = blueprint.get("sections", [])
-    lines = []
+    sections = blueprint.get("sections") or []
+    lines: List[str] = []
     for section in sections:
-        title = str(section.get("title", "Section"))
-        beats = section.get("beats") or []
-        beat_text = " ".join(str(b) for b in beats)
-        lines.append(f"[{title.upper()}]\n{beat_text}")
-    full_text = "\n\n".join(lines)
+        lines.append(f"{section['label']}: {section['focus']}.")
+    full_text = " ".join(lines)
     return {
+        "target_minutes": int(target_minutes),
         "full_text": full_text,
-        "target_minutes": target_minutes,
-        "word_count": _word_count(full_text),
+        "segments": [{"section_id": s["section_id"], "text": f"{s['label']}: {s['focus']}."} for s in sections],
     }
 
 
-def build_subtitles_asset(
-    script_result: Dict[str, Any],
-    audio_result: Dict[str, Any],
+def build_scene_plan(blueprint: Dict[str, Any], script_result: Dict[str, Any]) -> Dict[str, Any]:
+    _ = script_result
+    scenes = []
+    for idx, section in enumerate(blueprint.get("sections") or [], start=1):
+        scenes.append(
+            {
+                "scene_id": idx,
+                "section": section.get("label"),
+                "visual_prompt": f"Cinematic documentary frame about {section.get('focus')}",
+            }
+        )
+    return {"scene_count": len(scenes), "scenes": scenes}
+
+
+def build_image_assets(
+    scene_plan: Dict[str, Any],
     *,
-    out_dir: str = "outputs/subtitles",
-    smoke: bool = False,
+    openai_key: Optional[str],
+    smoke: bool,
+    max_images: int = 60,
 ) -> Dict[str, Any]:
-    script_text = str(script_result.get("full_text", "") or "")
-
-    total_seconds = audio_result.get("duration_seconds")
-    if total_seconds is None:
-        total_seconds = _estimate_duration_seconds(script_text)
-    total_seconds = round(float(total_seconds or 0.0), 3)
-
-    captions = split_script_into_captions(script_text)
-    timed = assign_timings(captions, total_seconds=total_seconds)
-
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    script_sha = hashlib.sha256(script_text.encode("utf-8")).hexdigest()
-    audio_sha = str(audio_result.get("sha256", ""))
-
-    if smoke:
-        filename = "vo_smoke.srt"
-        mode = "smoke"
-    else:
-        basis = f"{audio_sha}:{script_sha}".encode("utf-8")
-        filename = f"vo_{hashlib.sha256(basis).hexdigest()[:16]}.srt"
-        mode = "real"
-
-    srt_path = str(Path(out_dir) / filename)
-    write_srt(timed, srt_path)
-    srt_sha = hashlib.sha256(Path(srt_path).read_bytes()).hexdigest()
-
-    return {
-        "srt_path": srt_path,
-        "total_seconds": total_seconds,
-        "caption_count": len(timed),
-        "sha256": srt_sha,
-        "mode": mode,
-    }
+    scenes = scene_plan.get("scenes") or []
+    return generate_scene_images(
+        scenes,
+        openai_key=openai_key,
+        smoke=smoke,
+        max_images=max_images,
+    )

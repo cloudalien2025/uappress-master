@@ -19,28 +19,11 @@ import json
 from typing import Any, Dict
 
 import streamlit as st
-try:
-    from .ci_hooks import ci_smoke_enabled, mark_run_done
-except Exception:
-    from ci_hooks import ci_smoke_enabled, mark_run_done
 
 try:
-    from .uappress_engine import (  # type: ignore
-        build_documentary_blueprint,
-        build_subtitles_asset,
-        compile_voiceover_script,
-    )
+    from ci_hooks import ci_smoke_enabled, mark_run_done
 except Exception:
-    try:
-        from uappress_engine import (  # type: ignore
-            build_documentary_blueprint,
-            build_subtitles_asset,
-            compile_voiceover_script,
-        )
-    except Exception:
-        build_documentary_blueprint = None
-        compile_voiceover_script = None
-        build_subtitles_asset = None
+    from .ci_hooks import ci_smoke_enabled, mark_run_done
 
 
 # ------------------------------------------------------------------------------
@@ -56,18 +39,39 @@ try:
         build_audio_asset,
     )
 except Exception:
-    class ResearchJob:  # type: ignore
-        def __init__(self, primary_topic: str):
-            self.primary_topic = primary_topic
+    try:
+        from .research_engine import run_research  # type: ignore
+    except Exception:
+        def run_research(**kwargs) -> Dict[str, Any]:
+            # Safe placeholder: never crashes UI
+            return {
+                "status": "PRELIMINARY",
+                "confidence_overall": 0.62,
+                "note": "run_research import not wired yet (fallback stub).",
+                "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
+            }
 
-    def run_research(*args, **kwargs) -> Dict[str, Any]:
-        # Safe placeholder: never crashes UI
-        return {
-            "status": "PRELIMINARY",
-            "confidence_overall": 0.62,
-            "note": "run_research import not wired yet (fallback stub).",
-            "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
-        }
+
+try:
+    from uappress_engine import (
+        build_documentary_blueprint,
+        build_image_assets,
+        build_scene_plan,
+        compile_voiceover_script,
+    )
+except Exception:
+    try:
+        from .uappress_engine import (
+            build_documentary_blueprint,
+            build_image_assets,
+            build_scene_plan,
+            compile_voiceover_script,
+        )
+    except Exception:
+        build_documentary_blueprint = None
+        compile_voiceover_script = None
+        build_scene_plan = None
+        build_image_assets = None
 
     def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
         return {"topic": dossier.get("topic", "Unknown"), "acts": ["Setup", "Complication", "Resolution"]}
@@ -194,12 +198,8 @@ if "last_run_ts" not in st.session_state:
     st.session_state["last_run_ts"] = None
 if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
-if "last_script_result" not in st.session_state:
-    st.session_state["last_script_result"] = None
-if "last_audio_result" not in st.session_state:
-    st.session_state["last_audio_result"] = None
-if "last_subtitles" not in st.session_state:
-    st.session_state["last_subtitles"] = None
+if "last_images" not in st.session_state:
+    st.session_state["last_images"] = None
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -240,6 +240,7 @@ def _mock_dossier(topic: str) -> Dict[str, Any]:
 if run_button:
     st.session_state["run_status"] = "RUNNING"
     st.session_state["last_run_ts"] = int(time.time())
+    st.session_state["last_images"] = None
 
     if not primary_topic:
         st.warning("Please enter a topic.")
@@ -325,46 +326,51 @@ if dossier:
             url = str(s.get("url", ""))
             st.markdown(f"{i}. **{title}** — {url}")
 
-    st.subheader("Subtitles (SRT)")
-    if st.button("Generate Subtitles (SRT)", key="generate_subtitles_btn"):
-        script_result = st.session_state.get("last_script_result")
-        if not script_result:
-            st.warning("Voiceover script required before generating subtitles.")
-        elif build_subtitles_asset is None:
-            st.warning("Subtitles engine unavailable in this environment.")
-        else:
-            audio_result = st.session_state.get("last_audio_result") or {}
-            subtitles = build_subtitles_asset(
-                script_result,
-                audio_result=audio_result,
-                smoke=SMOKE_MODE,
-            )
-            st.session_state["last_subtitles"] = subtitles
+    if (
+        build_documentary_blueprint is not None
+        and compile_voiceover_script is not None
+        and build_scene_plan is not None
+        and build_image_assets is not None
+    ):
+        blueprint = build_documentary_blueprint(dossier)
+        script_result = compile_voiceover_script(blueprint, target_minutes=12)
+        scene_plan = build_scene_plan(blueprint, script_result)
 
-    subtitles = st.session_state.get("last_subtitles")
-    if subtitles:
-        st.json(
-            {
-                "srt_path": subtitles.get("srt_path"),
-                "caption_count": subtitles.get("caption_count"),
-                "sha256": subtitles.get("sha256"),
-            }
-        )
+        st.subheader("Scene Plan")
+        st.json(scene_plan)
 
-    bundle = {
+        if st.button("Generate Images", key="generate_images_button"):
+            try:
+                st.session_state["last_images"] = build_image_assets(
+                    scene_plan,
+                    openai_key=openai_key or None,
+                    smoke=SMOKE_MODE,
+                    max_images=60,
+                )
+            except Exception as e:
+                st.error(f"Image generation failed: {str(e)}")
+
+        image_result = st.session_state.get("last_images")
+        if image_result:
+            st.subheader("Image Assets")
+            st.write(f"image_count: {image_result.get('image_count', 0)}")
+            st.write(f"out_dir: {image_result.get('out_dir', '')}")
+            preview_images = (image_result.get("images") or [])[:3]
+            st.write("Preview (first 3):")
+            for item in preview_images:
+                st.write(f"- {item.get('path')} | {item.get('sha256')}")
+
+    bundle_payload = {
         "dossier": dossier,
-        "script": st.session_state.get("last_script_result"),
-        "audio": st.session_state.get("last_audio_result"),
-        "subtitles": st.session_state.get("last_subtitles"),
+        "images": st.session_state.get("last_images"),
     }
     st.download_button(
         "Download Bundle JSON",
-        data=json.dumps(bundle, indent=2),
+        data=json.dumps(bundle_payload, indent=2),
         file_name="uappress_bundle.json",
         mime="application/json",
-        key="download_bundle_btn",
+        key="download_bundle_json",
     )
-
 else:
     st.info("Enter a topic and click Run Research to generate a dossier.")
     st.caption("TEST_HOOK:EMPTY_STATE")
