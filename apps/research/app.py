@@ -19,68 +19,38 @@ import json
 from typing import Any, Dict
 
 import streamlit as st
-from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
-from apps.research.uappress_engine import score_topic
+try:
+    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
+except Exception:
+    from ci_hooks import ci_smoke_enabled, mark_run_done
 
 
 # ------------------------------------------------------------------------------
 # Import-time safe research function
 # ------------------------------------------------------------------------------
-try:
-    from apps.research.uappress_engine import (  # type: ignore
-        ResearchJob,
-        run_research,
-        build_documentary_blueprint,
-        compile_voiceover_script,
-        build_scene_plan,
-        build_audio_asset,
-    )
-except Exception:
-    try:
-        from .research_engine import run_research  # type: ignore
-    except Exception:
-        def run_research(**kwargs) -> Dict[str, Any]:
-            # Safe placeholder: never crashes UI
-            return {
-                "status": "PRELIMINARY",
-                "confidence_overall": 0.62,
-                "note": "run_research import not wired yet (fallback stub).",
-                "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
-            }
-
+ENGINE_IMPORT_OK = True
 
 try:
-    from uappress_engine import (
-        build_documentary_blueprint,
-        build_image_assets,
-        build_scene_plan,
-        compile_voiceover_script,
-    )
+    from apps.research.uappress_engine import run_research, ResearchJob  # type: ignore
 except Exception:
-    try:
-        from .uappress_engine import (
-            build_documentary_blueprint,
-            build_image_assets,
-            build_scene_plan,
-            compile_voiceover_script,
-        )
-    except Exception:
-        build_documentary_blueprint = None
-        compile_voiceover_script = None
-        build_scene_plan = None
-        build_image_assets = None
+    ENGINE_IMPORT_OK = False
 
-    def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
-        return {"topic": dossier.get("topic", "Unknown"), "acts": ["Setup", "Complication", "Resolution"]}
+    @st.cache_data(show_spinner=False)
+    def _fallback_job_type() -> str:
+        return "fallback"
 
-    def compile_voiceover_script(blueprint: Dict[str, Any], target_minutes: int = 12) -> Dict[str, Any]:
-        return {"target_minutes": target_minutes, "full_text": f"Voiceover script for {blueprint.get('topic', 'Unknown')}"}
+    class ResearchJob:  # type: ignore
+        pass
 
-    def build_scene_plan(blueprint: Dict[str, Any], script_result: Dict[str, Any]) -> Dict[str, Any]:
-        return {"topic": blueprint.get("topic", "Unknown"), "scenes": []}
-
-    def build_audio_asset(script_result: dict, *, openai_key: str | None, smoke: bool) -> dict:
-        return {"mode": "smoke" if smoke else "real", "mp3_path": "", "duration_seconds": 0.0, "voice": "onyx", "model": "gpt-4o-mini-tts", "sha256": ""}
+    def run_research(**kwargs) -> Dict[str, Any]:
+        # Safe placeholder: never crashes UI
+        return {
+            "status": "PRELIMINARY",
+            "confidence_overall": 0.62,
+            "note": "run_research import not wired yet (fallback stub).",
+            "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
+            "job_type": _fallback_job_type(),
+        }
 
 
 # ------------------------------------------------------------------------------
@@ -178,6 +148,8 @@ with st.sidebar:
         include_gov_docs = True
 
     st.divider()
+    st.caption(f"ENGINE_IMPORT: {'OK' if ENGINE_IMPORT_OK else 'FALLBACK'}")
+
     if SMOKE_MODE:
         st.success("Smoke mode enabled — no API keys required.")
         st.caption("TEST_HOOK:SMOKE_MODE")
