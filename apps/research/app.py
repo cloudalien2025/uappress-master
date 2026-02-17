@@ -12,21 +12,44 @@
 #   the Primary Topic input and Run Research button.
 # - Smoke mode must be enabled in GitHub Actions where CI is typically "true".
 
+import json
 import os
 import time
 from typing import Any, Dict
 
 import streamlit as st
-from ci_hooks import ci_smoke_enabled, mark_run_done
+
+try:
+    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
+except Exception:
+    from ci_hooks import ci_smoke_enabled, mark_run_done
 
 
 # ------------------------------------------------------------------------------
 # Import-time safe research function
 # ------------------------------------------------------------------------------
 try:
-    # Adjust to match your project if/when you wire the real engine
-    from research_engine import run_research  # type: ignore
+    try:
+        from apps.research.uappress_engine import (  # type: ignore
+            ResearchJob,
+            build_documentary_blueprint,
+            build_scene_plan,
+            compile_voiceover_script,
+            run_research,
+        )
+    except Exception:
+        from uappress_engine import (  # type: ignore
+            ResearchJob,
+            build_documentary_blueprint,
+            build_scene_plan,
+            compile_voiceover_script,
+            run_research,
+        )
 except Exception:
+    class ResearchJob:
+        def __init__(self, primary_topic: str):
+            self.primary_topic = primary_topic
+
     def run_research(**kwargs) -> Dict[str, Any]:
         # Safe placeholder: never crashes UI
         return {
@@ -35,6 +58,23 @@ except Exception:
             "note": "run_research import not wired yet (fallback stub).",
             "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
         }
+
+    def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
+        topic = str(dossier.get("topic") or "Unknown topic")
+        return {"title": topic, "topic": topic}
+
+    def compile_voiceover_script(blueprint: Dict[str, Any], *, target_minutes: int = 12) -> Dict[str, Any]:
+        topic = str(blueprint.get("title") or blueprint.get("topic") or "Unknown topic")
+        return {"target_minutes": target_minutes, "title": topic, "full_text": "[ACT 1]\nFallback script."}
+
+    def build_scene_plan(
+        blueprint: Dict[str, Any],
+        script_result: Dict[str, Any],
+        *,
+        target_scene_seconds: float = 6.0,
+        max_scenes: int = 180,
+    ) -> Dict[str, Any]:
+        return {"target_scene_seconds": target_scene_seconds, "scenes": [], "estimated_total_seconds": 0.0}
 
 
 # ------------------------------------------------------------------------------
@@ -208,13 +248,9 @@ if run_button:
             dossier = _mock_dossier(primary_topic)
         else:
             dossier = run_research(
-                primary_topic=primary_topic,
+                job=ResearchJob(primary_topic=primary_topic),
                 serpapi_key=serpapi_key,
                 openai_key=openai_key or None,
-                confidence_threshold=confidence_threshold,
-                max_serp_queries=max_serp_queries,
-                max_sources=max_sources,
-                include_gov_docs=include_gov_docs,
             )
 
         st.session_state["last_dossier"] = dossier
@@ -249,6 +285,29 @@ if dossier:
 
     st.subheader("Dossier Output")
     st.json(dossier)
+
+    blueprint = build_documentary_blueprint(dossier)
+    script_result = compile_voiceover_script(blueprint, target_minutes=12)
+    scene_plan = build_scene_plan(blueprint, script_result, target_scene_seconds=6.0, max_scenes=180)
+
+    st.subheader("Voiceover Script")
+    st.json(script_result)
+
+    st.subheader("Scene Plan")
+    st.json(scene_plan)
+
+    bundle = {
+        "dossier": dossier,
+        "blueprint": blueprint,
+        "script": script_result,
+        "scene_plan": scene_plan,
+    }
+    st.download_button(
+        "Download Bundle (JSON)",
+        data=json.dumps(bundle, sort_keys=True, indent=2),
+        file_name="uappress_bundle.json",
+        mime="application/json",
+    )
 
     sources = dossier.get("sources") or []
     if isinstance(sources, list) and sources:
