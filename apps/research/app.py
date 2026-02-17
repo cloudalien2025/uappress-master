@@ -24,8 +24,7 @@ from ci_hooks import ci_smoke_enabled, mark_run_done
 # Import-time safe research function
 # ------------------------------------------------------------------------------
 try:
-    # Adjust to match your project if/when you wire the real engine
-    from research_engine import run_research  # type: ignore
+    from apps.research.uappress_engine_v9 import run_research  # type: ignore
 except Exception:
     def run_research(**kwargs) -> Dict[str, Any]:
         # Safe placeholder: never crashes UI
@@ -53,6 +52,7 @@ SMOKE_MODE = (
 # ------------------------------------------------------------------------------
 st.set_page_config(page_title="UAPpress Research Engine", layout="wide")
 st.title("UAPpress Research Engine")
+st.caption("DEPLOY_STAMP: 2026-02-17-B")
 
 # Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
