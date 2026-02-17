@@ -16,6 +16,8 @@ import json
 import os
 import time
 import json
+import inspect
+from dataclasses import dataclass
 from typing import Any, Dict
 
 import streamlit as st
@@ -43,8 +45,9 @@ except Exception:
     def _fallback_job_type() -> str:
         return "fallback"
 
+    @dataclass
     class ResearchJob:  # type: ignore
-        pass
+        primary_topic: str
 
     def run_research(**kwargs) -> Dict[str, Any]:
         # Safe placeholder: never crashes UI
@@ -56,8 +59,26 @@ except Exception:
             "job_type": _fallback_job_type(),
         }
 
+    @dataclass
     class ResearchJob:  # type: ignore[no-redef]
-        pass
+        primary_topic: str
+
+
+def _create_research_job(primary_topic: str) -> Any:
+    attempted_kwargs = {"primary_topic": primary_topic}
+    try:
+        return ResearchJob(**attempted_kwargs)
+    except TypeError as exc:
+        module_name = getattr(ResearchJob, "__module__", "<unknown>")
+        try:
+            ctor_sig = str(inspect.signature(ResearchJob))
+        except Exception:
+            ctor_sig = "<unavailable>"
+        raise RuntimeError(
+            "ResearchJob constructor mismatch "
+            f"(loaded={module_name}.ResearchJob, signature={ctor_sig}, "
+            f"attempted_kwargs={list(attempted_kwargs.keys())})"
+        ) from exc
 
 
 # ------------------------------------------------------------------------------
@@ -84,6 +105,7 @@ st.caption(f"UI Version: {ui_version}")
 # Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
 st.caption(ENGINE_IMPORT_MARKER)
+st.caption(f"TEST_HOOK:RESEARCHJOB_MODULE:{getattr(ResearchJob, '__module__', '<unknown>')}")
 
 
 # ------------------------------------------------------------------------------
@@ -286,8 +308,9 @@ if run_button:
         if SMOKE_MODE:
             dossier = _mock_dossier(primary_topic)
         else:
+            job = _create_research_job(primary_topic)
             dossier = run_research(
-                ResearchJob(primary_topic=primary_topic),
+                job,
                 serpapi_key=serpapi_key,
                 openai_key=openai_key or None,
             )
