@@ -24,7 +24,7 @@ from ci_hooks import ci_smoke_enabled, mark_run_done
 # Import-time safe research function
 # ------------------------------------------------------------------------------
 try:
-    # Adjust to match your project if/when you wire the real engine
+    # Wired implementation lives in apps/research/research_engine.py
     from research_engine import run_research  # type: ignore
 except Exception:
     def run_research(**kwargs) -> Dict[str, Any]:
