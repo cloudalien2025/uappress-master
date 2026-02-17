@@ -13,7 +13,7 @@
 # - Smoke mode must be enabled in GitHub Actions where CI is typically "true".
 
 import json
-import os
+import os as _os
 import time
 import json
 import inspect
@@ -86,8 +86,8 @@ def _create_research_job(primary_topic: str) -> Any:
 # ------------------------------------------------------------------------------
 # Explicit envs (optional) + robust CI detection via ci_smoke_enabled()
 SMOKE_MODE = (
-    os.getenv("UAPPRESS_SMOKE", "").strip() == "1"
-    or os.getenv("UAPPRESS_CI_SMOKE", "").strip() == "1"
+    _os.getenv("UAPPRESS_SMOKE", "").strip() == "1"
+    or _os.getenv("UAPPRESS_CI_SMOKE", "").strip() == "1"
     or ci_smoke_enabled()
 )
 
@@ -99,7 +99,7 @@ st.set_page_config(page_title="UAPpress Research Engine", layout="wide")
 st.title("UAPpress Research Engine")
 st.caption("DEPLOY_STAMP: 2026-02-17-B")
 
-ui_version = os.getenv("UAPPRESS_UI_VERSION", "dev-local").strip() or "dev-local"
+ui_version = _os.getenv("UAPPRESS_UI_VERSION", "dev-local").strip() or "dev-local"
 st.caption(f"UI Version: {ui_version}")
 
 # Stable marker for Playwright to know Streamlit hydrated
