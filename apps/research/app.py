@@ -81,6 +81,26 @@ def _create_research_job(primary_topic: str) -> Any:
         ) from exc
 
 
+def _assert_run_research_signature() -> None:
+    """Fail fast with a clearer error if callback wiring/signature drifts."""
+    try:
+        sig = inspect.signature(run_research)
+    except Exception:
+        return
+
+    params = sig.parameters
+    accepts_kwargs = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    if accepts_kwargs or "job" in params:
+        return
+
+    raise RuntimeError(
+        "run_research signature mismatch: expected a 'job' parameter or **kwargs "
+        f"but got {sig}"
+    )
+
+
 # ------------------------------------------------------------------------------
 # Deterministic modes
 # ------------------------------------------------------------------------------
@@ -309,8 +329,9 @@ if run_button:
             dossier = _mock_dossier(primary_topic)
         else:
             job = _create_research_job(primary_topic)
+            _assert_run_research_signature()
             dossier = run_research(
-                job,
+                job=job,
                 serpapi_key=serpapi_key,
                 openai_key=openai_key or None,
             )
