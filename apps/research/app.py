@@ -94,6 +94,7 @@ st.title("UAPpress Research Engine")
 
 # Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
+st.caption(ENGINE_IMPORT_MARKER)
 
 
 # ------------------------------------------------------------------------------
@@ -247,6 +248,11 @@ if run_button:
         else:
             dossier = run_research(
                 job=ResearchJob(primary_topic=primary_topic),
+                serpapi_key=serpapi_key,
+                openai_key=openai_key or None,
+            )
+            dossier = run_research(
+                job=job,
                 serpapi_key=serpapi_key,
                 openai_key=openai_key or None,
             )
