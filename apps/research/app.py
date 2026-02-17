@@ -15,6 +15,7 @@
 import json
 import os
 import time
+import json
 from typing import Any, Dict
 
 import streamlit as st
@@ -29,8 +30,14 @@ except Exception:
 # Import-time safe research function
 # ------------------------------------------------------------------------------
 try:
-    # Adjust to match your project if/when you wire the real engine
-    from research_engine import run_research  # type: ignore
+    from apps.research.uappress_engine import (  # type: ignore
+        ResearchJob,
+        run_research,
+        build_documentary_blueprint,
+        compile_voiceover_script,
+        build_scene_plan,
+        build_audio_asset,
+    )
 except Exception:
     try:
         from .research_engine import run_research  # type: ignore
@@ -66,6 +73,18 @@ except Exception:
         build_scene_plan = None
         build_image_assets = None
 
+    def build_documentary_blueprint(dossier: Dict[str, Any]) -> Dict[str, Any]:
+        return {"topic": dossier.get("topic", "Unknown"), "acts": ["Setup", "Complication", "Resolution"]}
+
+    def compile_voiceover_script(blueprint: Dict[str, Any], target_minutes: int = 12) -> Dict[str, Any]:
+        return {"target_minutes": target_minutes, "full_text": f"Voiceover script for {blueprint.get('topic', 'Unknown')}"}
+
+    def build_scene_plan(blueprint: Dict[str, Any], script_result: Dict[str, Any]) -> Dict[str, Any]:
+        return {"topic": blueprint.get("topic", "Unknown"), "scenes": []}
+
+    def build_audio_asset(script_result: dict, *, openai_key: str | None, smoke: bool) -> dict:
+        return {"mode": "smoke" if smoke else "real", "mp3_path": "", "duration_seconds": 0.0, "voice": "onyx", "model": "gpt-4o-mini-tts", "sha256": ""}
+
 
 # ------------------------------------------------------------------------------
 # Deterministic modes
@@ -86,6 +105,7 @@ st.title("UAPpress Research Engine")
 
 # Stable marker for Playwright to know Streamlit hydrated
 st.caption("TEST_HOOK:APP_LOADED")
+st.caption(ENGINE_IMPORT_MARKER)
 
 
 # ------------------------------------------------------------------------------
@@ -241,16 +261,20 @@ if run_button:
             dossier = _mock_dossier(primary_topic)
         else:
             dossier = run_research(
-                primary_topic=primary_topic,
+                ResearchJob(primary_topic=primary_topic),
                 serpapi_key=serpapi_key,
                 openai_key=openai_key or None,
-                confidence_threshold=confidence_threshold,
-                max_serp_queries=max_serp_queries,
-                max_sources=max_sources,
-                include_gov_docs=include_gov_docs,
             )
 
+        blueprint = build_documentary_blueprint(dossier)
+        script_result = compile_voiceover_script(blueprint)
+        scene_plan = build_scene_plan(blueprint, script_result)
+
         st.session_state["last_dossier"] = dossier
+        st.session_state["last_blueprint"] = blueprint
+        st.session_state["last_script"] = script_result
+        st.session_state["last_scene_plan"] = scene_plan
+        st.session_state["last_audio"] = None
         st.session_state["run_status"] = "DONE"
 
     except Exception as e:
@@ -264,6 +288,9 @@ if run_button:
 # Output Rendering (stable; always renders if we have data)
 # ------------------------------------------------------------------------------
 dossier = st.session_state.get("last_dossier")
+blueprint = st.session_state.get("last_blueprint")
+script_result = st.session_state.get("last_script")
+scene_plan = st.session_state.get("last_scene_plan")
 
 if dossier:
     score = float(dossier.get("confidence_overall", 0) or 0)
@@ -282,6 +309,14 @@ if dossier:
 
     st.subheader("Dossier Output")
     st.json(dossier)
+
+    if (
+        st.session_state.get("last_script_result") is None
+        and build_documentary_blueprint is not None
+        and compile_voiceover_script is not None
+    ):
+        blueprint = build_documentary_blueprint(dossier)
+        st.session_state["last_script_result"] = compile_voiceover_script(blueprint)
 
     sources = dossier.get("sources") or []
     if isinstance(sources, list) and sources:
