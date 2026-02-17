@@ -17,15 +17,19 @@ import time
 from typing import Any, Dict
 
 import streamlit as st
-from ci_hooks import ci_smoke_enabled, mark_run_done
+try:
+    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
+except Exception:
+    from ci_hooks import ci_smoke_enabled, mark_run_done
 
 
 # ------------------------------------------------------------------------------
 # Import-time safe research function
 # ------------------------------------------------------------------------------
+ENGINE_IMPORT_OK = False
 try:
-    # Adjust to match your project if/when you wire the real engine
-    from research_engine import run_research  # type: ignore
+    from apps.research.uappress_engine import run_research, ResearchJob
+    ENGINE_IMPORT_OK = True
 except Exception:
     def run_research(**kwargs) -> Dict[str, Any]:
         # Safe placeholder: never crashes UI
@@ -35,6 +39,9 @@ except Exception:
             "note": "run_research import not wired yet (fallback stub).",
             "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
         }
+
+    class ResearchJob:  # type: ignore[no-redef]
+        pass
 
 
 # ------------------------------------------------------------------------------
@@ -129,6 +136,10 @@ with st.sidebar:
         max_serp_queries = 12
         max_sources = 25
         include_gov_docs = True
+
+    st.divider()
+    st.caption(f"ENGINE_IMPORT: {'OK' if ENGINE_IMPORT_OK else 'FALLBACK'}")
+    st.caption(f"APP_FILE: {__file__}")
 
     st.divider()
     if SMOKE_MODE:
