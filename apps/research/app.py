@@ -25,12 +25,17 @@ except Exception:
     from ci_hooks import ci_smoke_enabled, mark_run_done
 
 
+# Import marker must always exist for Streamlit Cloud import safety.
+ENGINE_IMPORT_MARKER = "TEST_HOOK:ENGINE_IMPORT_FALLBACK"
+
 # ------------------------------------------------------------------------------
 # Import-time safe research function
 # ------------------------------------------------------------------------------
 ENGINE_IMPORT_OK = False
 try:
     from apps.research.uappress_engine_v9 import run_research  # type: ignore
+    ENGINE_IMPORT_OK = True
+    ENGINE_IMPORT_MARKER = "TEST_HOOK:ENGINE_IMPORT_OK"
 except Exception:
     ENGINE_IMPORT_OK = False
 
