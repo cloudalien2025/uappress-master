@@ -14,10 +14,32 @@
 
 import os
 import time
+import json
 from typing import Any, Dict
 
 import streamlit as st
-from ci_hooks import ci_smoke_enabled, mark_run_done
+try:
+    from .ci_hooks import ci_smoke_enabled, mark_run_done
+except Exception:
+    from ci_hooks import ci_smoke_enabled, mark_run_done
+
+try:
+    from .uappress_engine import (  # type: ignore
+        build_documentary_blueprint,
+        build_subtitles_asset,
+        compile_voiceover_script,
+    )
+except Exception:
+    try:
+        from uappress_engine import (  # type: ignore
+            build_documentary_blueprint,
+            build_subtitles_asset,
+            compile_voiceover_script,
+        )
+    except Exception:
+        build_documentary_blueprint = None
+        compile_voiceover_script = None
+        build_subtitles_asset = None
 
 
 # ------------------------------------------------------------------------------
@@ -148,6 +170,12 @@ if "last_run_ts" not in st.session_state:
     st.session_state["last_run_ts"] = None
 if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
+if "last_script_result" not in st.session_state:
+    st.session_state["last_script_result"] = None
+if "last_audio_result" not in st.session_state:
+    st.session_state["last_audio_result"] = None
+if "last_subtitles" not in st.session_state:
+    st.session_state["last_subtitles"] = None
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -250,6 +278,14 @@ if dossier:
     st.subheader("Dossier Output")
     st.json(dossier)
 
+    if (
+        st.session_state.get("last_script_result") is None
+        and build_documentary_blueprint is not None
+        and compile_voiceover_script is not None
+    ):
+        blueprint = build_documentary_blueprint(dossier)
+        st.session_state["last_script_result"] = compile_voiceover_script(blueprint)
+
     sources = dossier.get("sources") or []
     if isinstance(sources, list) and sources:
         st.subheader("Top Sources")
@@ -257,6 +293,46 @@ if dossier:
             title = str(s.get("title", f"Source {i}"))
             url = str(s.get("url", ""))
             st.markdown(f"{i}. **{title}** — {url}")
+
+    st.subheader("Subtitles (SRT)")
+    if st.button("Generate Subtitles (SRT)", key="generate_subtitles_btn"):
+        script_result = st.session_state.get("last_script_result")
+        if not script_result:
+            st.warning("Voiceover script required before generating subtitles.")
+        elif build_subtitles_asset is None:
+            st.warning("Subtitles engine unavailable in this environment.")
+        else:
+            audio_result = st.session_state.get("last_audio_result") or {}
+            subtitles = build_subtitles_asset(
+                script_result,
+                audio_result=audio_result,
+                smoke=SMOKE_MODE,
+            )
+            st.session_state["last_subtitles"] = subtitles
+
+    subtitles = st.session_state.get("last_subtitles")
+    if subtitles:
+        st.json(
+            {
+                "srt_path": subtitles.get("srt_path"),
+                "caption_count": subtitles.get("caption_count"),
+                "sha256": subtitles.get("sha256"),
+            }
+        )
+
+    bundle = {
+        "dossier": dossier,
+        "script": st.session_state.get("last_script_result"),
+        "audio": st.session_state.get("last_audio_result"),
+        "subtitles": st.session_state.get("last_subtitles"),
+    }
+    st.download_button(
+        "Download Bundle JSON",
+        data=json.dumps(bundle, indent=2),
+        file_name="uappress_bundle.json",
+        mime="application/json",
+        key="download_bundle_btn",
+    )
 
 else:
     st.info("Enter a topic and click Run Research to generate a dossier.")
