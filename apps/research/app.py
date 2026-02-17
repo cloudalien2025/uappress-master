@@ -17,16 +17,29 @@ import time
 from typing import Any, Dict
 
 import streamlit as st
-from ci_hooks import ci_smoke_enabled, mark_run_done
+try:
+    from apps.research.ci_hooks import ci_smoke_enabled, mark_run_done
+except Exception:
+    from ci_hooks import ci_smoke_enabled, mark_run_done
 
 
 # ------------------------------------------------------------------------------
 # Import-time safe research function
 # ------------------------------------------------------------------------------
+ENGINE_IMPORT_OK = True
+
 try:
-    # Adjust to match your project if/when you wire the real engine
-    from research_engine import run_research  # type: ignore
+    from apps.research.uappress_engine import run_research, ResearchJob  # type: ignore
 except Exception:
+    ENGINE_IMPORT_OK = False
+
+    @st.cache_data(show_spinner=False)
+    def _fallback_job_type() -> str:
+        return "fallback"
+
+    class ResearchJob:  # type: ignore
+        pass
+
     def run_research(**kwargs) -> Dict[str, Any]:
         # Safe placeholder: never crashes UI
         return {
@@ -34,6 +47,7 @@ except Exception:
             "confidence_overall": 0.62,
             "note": "run_research import not wired yet (fallback stub).",
             "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
+            "job_type": _fallback_job_type(),
         }
 
 
@@ -131,6 +145,8 @@ with st.sidebar:
         include_gov_docs = True
 
     st.divider()
+    st.caption(f"ENGINE_IMPORT: {'OK' if ENGINE_IMPORT_OK else 'FALLBACK'}")
+
     if SMOKE_MODE:
         st.success("Smoke mode enabled — no API keys required.")
         st.caption("TEST_HOOK:SMOKE_MODE")
