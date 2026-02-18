@@ -114,14 +114,19 @@ def _consolidate_script_text(
     script_data = script_result if isinstance(script_result, dict) else {}
     scene_data = scene_plan if isinstance(scene_plan, dict) else {}
 
+    prebuilt_text = str(script_data.get("text") or "").strip()
+    if prebuilt_text:
+        return prebuilt_text
+
     scene_lines = []
     scenes = scene_data.get("scenes") if isinstance(scene_data.get("scenes"), list) else []
     for scene in scenes:
         if not isinstance(scene, dict):
             continue
-        heading = str(scene.get("heading") or "").strip()
-        visual = str(scene.get("visual") or "").strip()
-        combined = " — ".join([part for part in [heading, visual] if part])
+        heading = str(scene.get("heading") or scene.get("scene_title") or "").strip()
+        visual = str(scene.get("visual") or scene.get("visual_notes") or "").strip()
+        voiceover = str(scene.get("voiceover") or "").strip()
+        combined = "\n".join([part for part in [heading, visual, voiceover] if part])
         if combined:
             scene_lines.append(combined)
 
@@ -336,16 +341,125 @@ def _fallback_compile_voiceover_script(blueprint: Dict[str, Any]) -> Dict[str, A
     }
 
 
-def _fallback_build_scene_plan(blueprint: Dict[str, Any], script_result: Dict[str, Any]) -> Dict[str, Any]:
-    sections = blueprint.get("sections") or []
-    scenes = [
-        {
-            "scene": idx + 1,
-            "heading": str(section.get("heading") or f"Scene {idx + 1}"),
-            "visual": str(section.get("objective") or "Supporting visuals"),
-        }
-        for idx, section in enumerate(sections)
+def _fallback_build_documentary_script(
+    blueprint: Dict[str, Any],
+    dossier: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    topic = str(blueprint.get("topic") or "this case").strip() or "this case"
+    dossier_data = dossier if isinstance(dossier, dict) else {}
+    summary = str(dossier_data.get("summary") or blueprint.get("summary") or "").strip()
+
+    sources = dossier_data.get("sources") if isinstance(dossier_data.get("sources"), list) else []
+    source_citations = []
+    for idx, source in enumerate(sources, start=1):
+        if not isinstance(source, dict):
+            continue
+        title = str(source.get("title") or f"Source {idx}").strip()
+        url = str(source.get("url") or "").strip()
+        citation = f"[{idx}] {title}" if title else f"[{idx}]"
+        if url:
+            citation += f" ({url})"
+        source_citations.append(citation)
+    if not source_citations:
+        source_citations = ["[1] Public records and archived reporting", "[2] Expert commentary"]
+
+    key_points = []
+    for key in ("key_facts", "facts", "claims", "findings", "notes"):
+        values = dossier_data.get(key)
+        if isinstance(values, list):
+            for value in values:
+                text = str(value).strip()
+                if text and text not in key_points:
+                    key_points.append(text)
+    if summary and summary not in key_points:
+        key_points.insert(0, summary)
+    if not key_points:
+        key_points = [
+            f"{topic} has generated sustained public attention across institutions and communities.",
+            "Available evidence is mixed, so conclusions require careful sourcing and clear uncertainty labels.",
+            "A documentary narrative should separate established facts, interpretation, and unresolved questions.",
+        ]
+
+    scene_templates = [
+        ("Opening Context", "Establish timeline, place, and why the subject matters now."),
+        ("Origins", "Trace the earliest relevant events and actors."),
+        ("What the Records Show", "Present documented evidence and official reporting."),
+        ("How the Story Spread", "Cover media cycles, public interest, and framing changes."),
+        ("Competing Interpretations", "Contrast mainstream and alternative explanations."),
+        ("Data, Gaps, and Method", "Explain what can be measured and what remains uncertain."),
+        ("Human Stakes", "Show impact on institutions, policy, and affected communities."),
+        ("Critical Challenges", "Interrogate weak points, disputed claims, and bias risks."),
+        ("Where Research Stands", "Summarize current consensus and active debates."),
+        ("Conclusion", "Close with balanced takeaways and next evidence to watch."),
     ]
+
+    scenes: list[Dict[str, Any]] = []
+    for idx, (scene_title, intent) in enumerate(scene_templates, start=1):
+        fact_a = key_points[(idx - 1) % len(key_points)]
+        fact_b = key_points[idx % len(key_points)]
+        citation_a = source_citations[(idx - 1) % len(source_citations)]
+        citation_b = source_citations[idx % len(source_citations)]
+        voiceover = (
+            f"In this section, we focus on {topic} through the lens of {scene_title.lower()}. "
+            f"Our objective is to {intent.lower()} We begin with a grounded detail: {fact_a}. "
+            f"That point is useful, but it only tells part of the story, so we layer in a second thread: {fact_b}. "
+            f"Together, these observations reveal how interpretation can drift when context is missing. "
+            f"To keep the narrative evidence-led, we tag supporting material as {citation_a} and {citation_b}, "
+            "while noting that source quality and access can limit certainty. "
+            "As viewers, we should separate what is directly documented from what is inferred, and treat dramatic claims with proportionate scrutiny. "
+            "That discipline helps us move from speculation toward a reliable documentary account."
+        )
+        scenes.append(
+            {
+                "scene_number": idx,
+                "scene_title": scene_title,
+                "visual_notes": (
+                    f"Cinematic b-roll and graphics for {scene_title.lower()}: maps, timelines, archival clips, "
+                    f"and overlays highlighting: {fact_a}"
+                ),
+                "on_screen_text": [
+                    f"Scene {idx}: {scene_title}",
+                    f"Evidence tags: {citation_a}",
+                ],
+                "voiceover": voiceover,
+            }
+        )
+
+    narration_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes if scene.get("voiceover"))
+    word_count = len([token for token in narration_text.split() if token.strip()])
+
+    return {
+        "topic": topic,
+        "scenes": scenes,
+        "text": narration_text,
+        "word_count": word_count,
+        "scene_count": len(scenes),
+        "engine": "fallback",
+    }
+
+
+def _fallback_build_scene_plan(blueprint: Dict[str, Any], script_result: Dict[str, Any]) -> Dict[str, Any]:
+    script_scenes = script_result.get("scenes") if isinstance(script_result.get("scenes"), list) else []
+    if script_scenes:
+        scenes = [
+            {
+                "scene": int(scene.get("scene_number") or (idx + 1)),
+                "heading": str(scene.get("scene_title") or f"Scene {idx + 1}"),
+                "visual": str(scene.get("visual_notes") or "Supporting visuals"),
+            }
+            for idx, scene in enumerate(script_scenes)
+            if isinstance(scene, dict)
+        ]
+    else:
+        sections = blueprint.get("sections") or []
+        scenes = [
+            {
+                "scene": idx + 1,
+                "heading": str(section.get("heading") or f"Scene {idx + 1}"),
+                "visual": str(section.get("objective") or "Supporting visuals"),
+            }
+            for idx, section in enumerate(sections)
+        ]
     return {
         "scene_count": len(scenes),
         "scenes": scenes,
@@ -480,6 +594,7 @@ class EngineSurface:
     run_research: Any
     score_topic: Any
     build_documentary_blueprint: Any
+    build_documentary_script: Any
     compile_voiceover_script: Any
     build_scene_plan: Any
     build_video_asset: Any
@@ -564,6 +679,7 @@ engine = EngineSurface(
     run_research=run_research,
     score_topic=_fallback_score_topic,
     build_documentary_blueprint=_fallback_build_documentary_blueprint,
+    build_documentary_script=_fallback_build_documentary_script,
     compile_voiceover_script=_fallback_compile_voiceover_script,
     build_scene_plan=_fallback_build_scene_plan,
     build_video_asset=_fallback_build_video_asset,
@@ -919,14 +1035,18 @@ if run_button:
             raise
 
         try:
-            script_result = engine.compile_voiceover_script(blueprint)
+            if getattr(engine, "build_documentary_script", None) is not None:
+                script_result = engine.build_documentary_script(blueprint, dossier)
+            else:
+                script_result = engine.compile_voiceover_script(blueprint)
+
             scene_plan = engine.build_scene_plan(blueprint, script_result)
             generated_script_text = _consolidate_script_text(script_result, scene_plan)
             script_bundle = script_result if isinstance(script_result, dict) else {}
             script_bundle["text"] = generated_script_text
             script_bundle["scenes"] = (
-                scene_plan.get("scenes")
-                if isinstance(scene_plan, dict) and isinstance(scene_plan.get("scenes"), list)
+                script_bundle.get("scenes")
+                if isinstance(script_bundle.get("scenes"), list)
                 else []
             )
             script_bundle["locked"] = False
@@ -996,10 +1116,12 @@ if dossier:
     if (
         st.session_state.get("last_script_result") is None
         and engine.build_documentary_blueprint is not None
-        and engine.compile_voiceover_script is not None
     ):
         blueprint = engine.build_documentary_blueprint(dossier)
-        st.session_state["last_script_result"] = engine.compile_voiceover_script(blueprint)
+        if getattr(engine, "build_documentary_script", None) is not None:
+            st.session_state["last_script_result"] = engine.build_documentary_script(blueprint, dossier)
+        elif engine.compile_voiceover_script is not None:
+            st.session_state["last_script_result"] = engine.compile_voiceover_script(blueprint)
 
     sources = dossier.get("sources") or []
     if isinstance(sources, list) and sources:
@@ -1040,9 +1162,9 @@ if dossier:
     script_locked = bool(script_bundle.get("locked"))
     script_bundle["text"] = current_script_text
     script_bundle["scenes"] = (
-        scene_plan.get("scenes")
-        if isinstance(scene_plan, dict) and isinstance(scene_plan.get("scenes"), list)
-        else script_bundle.get("scenes") or []
+        script_bundle.get("scenes")
+        if isinstance(script_bundle.get("scenes"), list)
+        else []
     )
     script_bundle["locked"] = script_locked
     bundle["script"] = script_bundle
