@@ -15,9 +15,10 @@
 import json
 import os as _os
 import time
-import json
 import inspect
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Dict
 
 import streamlit as st
@@ -188,6 +189,44 @@ engine = EngineSurface(
     build_scene_plan=_fallback_build_scene_plan,
     build_video_asset=_fallback_build_video_asset,
 )
+
+
+def _to_jsonable(value: Any) -> Any:
+    """Recursively convert values into JSON-serializable primitives."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+
+    if isinstance(value, BaseException):
+        return {
+            "type": value.__class__.__name__,
+            "message": str(value),
+        }
+
+    if is_dataclass(value):
+        return _to_jsonable(asdict(value))
+
+    if isinstance(value, dict):
+        return {
+            str(k): _to_jsonable(v)
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(item) for item in value]
+
+    if hasattr(value, "__dict__"):
+        return _to_jsonable(vars(value))
+
+    return str(value)
 
 
 def _create_research_job(primary_topic: str) -> Any:
@@ -561,7 +600,7 @@ if dossier:
     }
     st.download_button(
         "Download Bundle",
-        data=json.dumps(bundle_payload, indent=2),
+        data=json.dumps(_to_jsonable(bundle_payload), indent=2),
         file_name="uappress_bundle.json",
         mime="application/json",
     )
