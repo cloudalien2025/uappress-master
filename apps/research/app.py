@@ -22,6 +22,7 @@ import inspect
 import importlib
 import shutil
 import subprocess
+import traceback
 import wave
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime
@@ -137,6 +138,59 @@ def _collect_missing_artifacts(
         missing.append(f"audio file not found: {audio_path}")
 
     return missing
+
+
+def _append_bundle_error(bundle: Dict[str, Any], stage: str, exc: BaseException) -> None:
+    errors = bundle.setdefault("errors", [])
+    if not isinstance(errors, list):
+        errors = []
+        bundle["errors"] = errors
+    errors.append(
+        {
+            "stage": stage,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+    )
+
+
+def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
+    bundle_data = bundle if isinstance(bundle, dict) else {}
+
+    script_result = bundle_data.get("script") if isinstance(bundle_data.get("script"), dict) else {}
+    scene_plan = bundle_data.get("scene_plan") if isinstance(bundle_data.get("scene_plan"), dict) else {}
+    scenes = scene_plan.get("scenes") if isinstance(scene_plan.get("scenes"), list) else []
+    has_narration = bool(str(script_result.get("narration") or "").strip())
+    has_script = bool(scenes) and has_narration
+
+    image_result = bundle_data.get("images") if isinstance(bundle_data.get("images"), dict) else {}
+    image_paths_raw = image_result.get("images") if isinstance(image_result.get("images"), list) else []
+    image_paths = [str(path).strip() for path in image_paths_raw if str(path).strip()]
+    has_images = bool(image_paths) and all(Path(path).exists() for path in image_paths)
+
+    audio_result = bundle_data.get("audio") if isinstance(bundle_data.get("audio"), dict) else {}
+    audio_path = str(
+        audio_result.get("audio_path")
+        or audio_result.get("audio_mp3_path")
+        or ""
+    ).strip()
+    has_audio = bool(audio_path) and Path(audio_path).exists()
+
+    missing_labels: list[str] = []
+    if not has_script:
+        missing_labels.append("Script")
+    if not has_images:
+        missing_labels.append("Images")
+    if not has_audio:
+        missing_labels.append("Audio")
+
+    return {
+        "has_script": has_script,
+        "has_images": has_images,
+        "has_audio": has_audio,
+        "ready_for_video": has_script and has_images and has_audio,
+        "missing_labels": missing_labels,
+    }
 
 
 def _fallback_score_topic(topic: str, serpapi_key: str | None = None, smoke: bool = False) -> Dict[str, Any]:
@@ -694,6 +748,8 @@ if "run_status" not in st.session_state:
     st.session_state["run_status"] = "IDLE"
 if "last_video" not in st.session_state:
     st.session_state["last_video"] = None
+if "last_bundle" not in st.session_state:
+    st.session_state["last_bundle"] = None
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -735,6 +791,15 @@ if run_button:
     st.session_state["run_status"] = "RUNNING"
     st.session_state["last_run_ts"] = int(time.time())
     st.session_state["last_images"] = None
+    st.session_state["last_audio"] = None
+    st.session_state["last_video"] = None
+
+    run_bundle: Dict[str, Any] = {
+        "mode": mode,
+        "topic": primary_topic,
+        "errors": [],
+    }
+    st.session_state["last_bundle"] = run_bundle
 
     if not primary_topic:
         st.warning("Please enter a topic.")
@@ -754,29 +819,59 @@ if run_button:
         if SMOKE_MODE:
             dossier = _mock_dossier(primary_topic)
         else:
-            job = _create_research_job(primary_topic)
-            _assert_run_research_signature()
-            dossier = engine.run_research(
-                job=job,
-                serpapi_key=serpapi_key,
-                openai_key=openai_key or None,
-            )
+            try:
+                job = _create_research_job(primary_topic)
+                _assert_run_research_signature()
+                dossier = engine.run_research(
+                    job=job,
+                    serpapi_key=serpapi_key,
+                    openai_key=openai_key or None,
+                )
+            except Exception as exc:
+                _append_bundle_error(run_bundle, "research", exc)
+                raise
 
-        blueprint = engine.build_documentary_blueprint(dossier)
-        script_result = engine.compile_voiceover_script(blueprint)
-        scene_plan = engine.build_scene_plan(blueprint, script_result)
+        run_bundle["dossier"] = dossier
+
+        try:
+            blueprint = engine.build_documentary_blueprint(dossier)
+            run_bundle["blueprint"] = blueprint
+        except Exception as exc:
+            _append_bundle_error(run_bundle, "blueprint", exc)
+            raise
+
+        try:
+            script_result = engine.compile_voiceover_script(blueprint)
+            scene_plan = engine.build_scene_plan(blueprint, script_result)
+            run_bundle["script"] = script_result
+            run_bundle["scene_plan"] = scene_plan
+        except Exception as exc:
+            _append_bundle_error(run_bundle, "script", exc)
+            raise
+
+        try:
+            image_result, audio_result = _ensure_fallback_artifacts(primary_topic, scene_plan)
+            run_bundle["images"] = image_result
+            run_bundle["audio"] = audio_result
+        except Exception as exc:
+            _append_bundle_error(run_bundle, "assets", exc)
+            raise
+
+        run_bundle["readiness"] = _artifact_readiness(run_bundle)
 
         st.session_state["last_dossier"] = dossier
         st.session_state["last_blueprint"] = blueprint
         st.session_state["last_script"] = script_result
         st.session_state["last_scene_plan"] = scene_plan
-        image_result, audio_result = _ensure_fallback_artifacts(primary_topic, scene_plan)
         st.session_state["last_images"] = image_result
         st.session_state["last_audio"] = audio_result
+        st.session_state["last_bundle"] = run_bundle
         st.session_state["run_status"] = "DONE"
 
     except Exception as e:
         st.session_state["run_status"] = "ERROR"
+        run_bundle["readiness"] = _artifact_readiness(run_bundle)
+        st.session_state["last_bundle"] = run_bundle
         st.error(f"Unexpected error: {str(e)}")
         st.caption("TEST_HOOK:RUN_ERROR")
         st.stop()
@@ -830,38 +925,53 @@ if dossier:
     audio_result = st.session_state.get("last_audio")
     subtitles_result = st.session_state.get("last_subtitles")
     scene_plan = st.session_state.get("last_scene_plan") or {}
+    bundle = st.session_state.get("last_bundle") or {
+        "dossier": dossier,
+        "blueprint": blueprint,
+        "script": script_result,
+        "scene_plan": scene_plan,
+        "images": image_result,
+        "audio": audio_result,
+        "video": st.session_state.get("last_video"),
+        "errors": [],
+    }
 
-    if st.button("Assemble Video (MP4)"):
-        missing_artifacts = _collect_missing_artifacts(image_result, audio_result)
-        if missing_artifacts:
-            st.warning(
-                "Video assembly prerequisites missing: "
-                + " | ".join(missing_artifacts)
+    bundle["readiness"] = _artifact_readiness(bundle)
+    readiness = bundle["readiness"]
+    missing_labels = readiness.get("missing_labels") or []
+
+    if missing_labels:
+        st.warning(
+            "Video Assembly is not ready. Missing: " + ", ".join(missing_labels)
+        )
+
+    if st.button("Assemble Video (MP4)", disabled=not readiness.get("ready_for_video", False)):
+        try:
+            st.session_state["last_video"] = engine.build_video_asset(
+                image_result=image_result,
+                audio_result=audio_result,
+                subtitles_result=subtitles_result,
+                scene_plan=scene_plan,
+                smoke=SMOKE_MODE,
             )
-        else:
-            try:
-                st.session_state["last_video"] = engine.build_video_asset(
-                    image_result=image_result,
-                    audio_result=audio_result,
-                    subtitles_result=subtitles_result,
-                    scene_plan=scene_plan,
-                    smoke=SMOKE_MODE,
-                )
-                st.success("Video assembly complete.")
-            except Exception as e:
-                previous_video = st.session_state.get("last_video")
-                last_error = str(e)
-                if isinstance(previous_video, dict):
-                    prior_error = str(previous_video.get("error") or "").strip()
-                    if prior_error:
-                        last_error = prior_error
-                st.session_state["last_video"] = {
-                    "mode": "smoke-fallback" if SMOKE_MODE else "fallback",
-                    "mp4_path": None,
-                    "sha256": None,
-                    "error": last_error,
-                }
-                st.error(f"Video assembly failed: {last_error}")
+            bundle["video"] = st.session_state["last_video"]
+            st.success("Video assembly complete.")
+        except Exception as e:
+            _append_bundle_error(bundle, "video_assembly", e)
+            previous_video = st.session_state.get("last_video")
+            last_error = str(e)
+            if isinstance(previous_video, dict):
+                prior_error = str(previous_video.get("error") or "").strip()
+                if prior_error:
+                    last_error = prior_error
+            st.session_state["last_video"] = {
+                "mode": "smoke-fallback" if SMOKE_MODE else "fallback",
+                "mp4_path": None,
+                "sha256": None,
+                "error": last_error,
+            }
+            bundle["video"] = st.session_state["last_video"]
+            st.error(f"Video assembly failed: {last_error}")
 
     video_result = st.session_state.get("last_video")
     if video_result:
@@ -877,15 +987,11 @@ if dossier:
         if mp4_path and Path(mp4_path).exists():
             st.video(mp4_path)
 
-    bundle_payload = {
-        "dossier": dossier,
-        "blueprint": blueprint,
-        "script": script_result,
-        "scene_plan": scene_plan,
-        "images": image_result,
-        "audio": audio_result,
-        "video": video_result,
-    }
+    bundle["video"] = video_result
+    bundle["readiness"] = _artifact_readiness(bundle)
+    st.session_state["last_bundle"] = bundle
+
+    bundle_payload = bundle
     st.download_button(
         "Download Bundle",
         data=json.dumps(_to_jsonable(bundle_payload), indent=2),
