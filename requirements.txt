@@ -3,3 +3,4 @@ requests
 beautifulsoup4
 pypdf
 playwright
+openai
