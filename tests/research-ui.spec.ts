@@ -13,8 +13,8 @@ test.describe("UAPpress Research Engine UI", () => {
     // Title / header text (keep these flexible)
     await expect(page.getByText("UAPpress Research Engine", { exact: false })).toBeVisible();
 
-    // Primary topic input exists (label text can vary by Streamlit theme)
-    await expect(page.getByText("Primary topic", { exact: false })).toBeVisible();
+    // Primary topic input exists
+    await expect(page.getByRole("textbox", { name: /Primary Topic/i })).toBeVisible();
 
     // Run button exists
     await expect(page.getByRole("button", { name: /Run Research/i })).toBeVisible();
