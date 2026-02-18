@@ -49,6 +49,12 @@ _MINIMAL_PNG_BASE64 = (
     "Qf4AAQAAAABJRU5ErkJggg=="
 )
 
+TARGET_DOCUMENTARY_MINUTES = 45
+WORDS_PER_MINUTE = 160
+TARGET_SCRIPT_WORDS = TARGET_DOCUMENTARY_MINUTES * WORDS_PER_MINUTE
+TTS_MODEL = "gpt-4o-mini-tts"
+TTS_VOICE = "onyx"
+
 
 def _ensure_fallback_artifacts(
     topic: str,
@@ -144,6 +150,61 @@ def _consolidate_script_text(
         parts.append("Narration:\n" + "\n".join(script_lines))
 
     return "\n\n".join([part for part in parts if part]).strip()
+
+
+
+
+def generate_script(bundle: Dict[str, Any], *, overwrite: bool = False) -> Dict[str, Any] | None:
+    dossier = bundle.get("dossier") if isinstance(bundle.get("dossier"), dict) else None
+    if not dossier:
+        return None
+    script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
+    if script_bundle.get("locked") and not overwrite:
+        return script_bundle
+    generated = _fallback_build_documentary_script(bundle.get("blueprint") or {}, dossier)
+    bundle["script"] = generated
+    bundle["scene_plan"] = _fallback_build_scene_plan(bundle.get("blueprint") or {}, generated)
+    return generated
+
+
+def generate_scene_mp3s(bundle: Dict[str, Any], *, openai_key: str, voice: str = TTS_VOICE, model: str = TTS_MODEL, smoke: bool = False) -> Dict[str, Any]:
+    if not openai_key:
+        raise ValueError("OpenAI API key missing. Set OPENAI_API_KEY to generate MP3s.")
+
+    script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
+    scenes = script_bundle.get("scenes") if isinstance(script_bundle.get("scenes"), list) else []
+    if not scenes:
+        raise ValueError("Generate Script first")
+
+    from apps.video.tts_engine import generate_vo_audio
+
+    base_dir = Path(tempfile.gettempdir()) / "uappress_artifacts" / str(st.session_state.get("last_run_ts") or int(time.time()))
+    audio_dir = base_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio_bundle = bundle.get("audio") if isinstance(bundle.get("audio"), dict) else {}
+    cache = audio_bundle.get("cache") if isinstance(audio_bundle.get("cache"), dict) else {}
+
+    scene_mp3s = []
+    for idx, scene in enumerate(scenes, start=1):
+        voiceover = str(scene.get("voiceover") or "").strip()
+        sig = hashlib.sha256(f"{voiceover}|{voice}|{model}".encode("utf-8")).hexdigest()
+        target = audio_dir / f"scene_{idx:02d}.mp3"
+        key = f"scene_{idx:02d}"
+        if not (cache.get(key) == sig and target.exists()):
+            result = generate_vo_audio(voiceover, out_dir=str(audio_dir), voice=voice, model=model, openai_key=openai_key, smoke=smoke)
+            src = Path(str(result.get("mp3_path") or ""))
+            if src.exists() and src != target:
+                target.write_bytes(src.read_bytes())
+            cache[key] = sig
+        duration_sec = round(len(voiceover.split()) / WORDS_PER_MINUTE * 60.0, 2)
+        scene["audio_path"] = str(target)
+        scene["audio_duration_sec"] = duration_sec
+        scene_mp3s.append({"scene": idx, "path": str(target), "duration_sec": duration_sec})
+
+    audio_bundle.update({"scene_mp3s": scene_mp3s, "format": "mp3", "voice": voice, "model": model, "cache": cache})
+    bundle["audio"] = audio_bundle
+    bundle["script"]["scenes"] = scenes
+    return audio_bundle
 
 
 def _ffmpeg_preflight() -> Dict[str, Any]:
@@ -246,7 +307,8 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
 
     script_result = bundle_data.get("script") if isinstance(bundle_data.get("script"), dict) else {}
     script_text = str(script_result.get("text") or "").strip()
-    has_script = bool(script_text)
+    script_scenes = script_result.get("scenes") if isinstance(script_result.get("scenes"), list) else []
+    has_script = bool(script_text) and bool(script_scenes)
 
     image_result = bundle_data.get("images") if isinstance(bundle_data.get("images"), dict) else {}
     image_paths_raw = image_result.get("images") if isinstance(image_result.get("images"), list) else []
@@ -278,11 +340,11 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
 
     missing_labels: list[str] = []
     if not has_script:
-        missing_labels.append("Script")
-    if not has_images:
-        missing_labels.append("Images")
+        missing_labels.append("Script scenes")
     if not has_audio:
-        missing_labels.append("Audio")
+        missing_labels.append("Scene MP3s")
+    if not has_images:
+        missing_labels.append("Scene images")
     if not has_ffmpeg:
         missing_labels.append("ffmpeg")
 
@@ -512,7 +574,6 @@ def _fallback_build_documentary_script(
 
     narration_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes)
     word_count = len([token for token in narration_text.split() if token.strip()])
-
     return {
         "topic": topic,
         "scenes": scenes,
@@ -521,6 +582,7 @@ def _fallback_build_documentary_script(
         "word_count_actual": word_count,
         "estimated_minutes": round(word_count / 160.0, 2),
         "scene_count": len(scenes),
+        "locked": False,
         "engine": "fallback",
     }
 
@@ -678,13 +740,10 @@ def _fallback_build_video_asset(
         if isinstance(candidate_paths, list):
             image_paths = [str(path).strip() for path in candidate_paths if str(path).strip()]
 
-    audio_path = ""
+    audio_paths: list[str] = []
     if isinstance(audio_result, dict):
-        audio_path = str(
-            audio_result.get("audio_path")
-            or audio_result.get("audio_mp3_path")
-            or ""
-        ).strip()
+        scene_mp3s = audio_result.get("scene_mp3s") if isinstance(audio_result.get("scene_mp3s"), list) else []
+        audio_paths = [str(item.get("path") or "").strip() for item in scene_mp3s if isinstance(item, dict) and str(item.get("path") or "").strip()]
 
     missing_artifacts = _collect_missing_artifacts(image_result, audio_result)
     preflight_errors: list[str] = []
@@ -715,7 +774,8 @@ def _fallback_build_video_asset(
         }
         return video_result
 
-    base_video_dir = Path(audio_path).resolve().parent.parent / "video"
+    first_audio = Path(audio_paths[0]).resolve()
+    base_video_dir = first_audio.parent.parent / "video"
     base_video_dir.mkdir(parents=True, exist_ok=True)
     mp4_path = base_video_dir / "fallback_assembly.mp4"
     concat_file = base_video_dir / "fallback_images.txt"
@@ -736,6 +796,14 @@ def _fallback_build_video_asset(
     concat_lines.append(f"file '{Path(image_paths[-1]).resolve().as_posix()}'")
     concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
 
+    audio_concat = base_video_dir / "fallback_audio.txt"
+    merged_audio_path = base_video_dir / "merged_audio.mp3"
+    audio_concat.write_text("\n".join([f"file '{Path(p).resolve().as_posix()}'" for p in audio_paths]) + "\n", encoding="utf-8")
+    audio_merge_cmd = [str(ffmpeg_binary), "-y", "-f", "concat", "-safe", "0", "-i", str(audio_concat), "-c", "copy", str(merged_audio_path)]
+    audio_merge_run = subprocess.run(audio_merge_cmd, capture_output=True, text=True, check=False)
+    if audio_merge_run.returncode != 0:
+        raise RuntimeError(audio_merge_run.stderr.strip() or "ffmpeg failed merging scene mp3 files")
+
     ffmpeg_cmd = [
         str(ffmpeg_binary),
         "-y",
@@ -746,7 +814,7 @@ def _fallback_build_video_asset(
         "-i",
         str(concat_file),
         "-i",
-        audio_path,
+        str(merged_audio_path),
         "-c:v",
         "libx264",
         "-pix_fmt",
@@ -1409,6 +1477,30 @@ if dossier:
         for item in scene_mp3s:
             if isinstance(item, dict):
                 st.code(str(item.get("audio_path") or ""))
+
+    st.subheader("Audio (Per-Scene TTS)")
+    if st.button("Generate MP3s (per scene)", use_container_width=True):
+        try:
+            updated_audio = generate_scene_mp3s(bundle, openai_key=openai_key or "", voice=TTS_VOICE, model=TTS_MODEL, smoke=SMOKE_MODE)
+            st.session_state["last_audio"] = updated_audio
+            st.success("Per-scene MP3s generated.")
+        except Exception as exc:
+            _append_bundle_error(bundle, "audio_tts", exc)
+            st.error(str(exc))
+
+    current_audio = bundle.get("audio") if isinstance(bundle.get("audio"), dict) else {}
+    scene_mp3s = current_audio.get("scene_mp3s") if isinstance(current_audio.get("scene_mp3s"), list) else []
+    for item in scene_mp3s[:3]:
+        path = str(item.get("path") or "").strip() if isinstance(item, dict) else ""
+        if path and Path(path).exists():
+            st.caption(f"Scene {item.get('scene')}: {path}")
+            st.audio(path)
+    if len(scene_mp3s) > 3:
+        st.caption("Additional MP3 files")
+        st.json(scene_mp3s[3:])
+
+    if not bundle.get("script", {}).get("scenes"):
+        st.warning("Image generation is disabled until script scenes exist.")
 
     st.subheader("Video Assembly")
     ffmpeg_check = _ffmpeg_preflight()
