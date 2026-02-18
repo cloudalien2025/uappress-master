@@ -52,6 +52,7 @@ _MINIMAL_PNG_BASE64 = (
 def _ensure_fallback_artifacts(
     topic: str,
     scene_plan: Dict[str, Any],
+    script_text: str,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     base_dir = (
         Path(tempfile.gettempdir())
@@ -85,11 +86,13 @@ def _ensure_fallback_artifacts(
         image_paths.append(str(image_path))
 
     audio_path = audio_dir / "fallback_narration.wav"
+    word_count = len([token for token in script_text.split() if token.strip()])
+    duration_seconds = max(2, int(round(word_count / 2.5))) if word_count else 2
     with wave.open(str(audio_path), "wb") as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
         wav_file.setframerate(16000)
-        wav_file.writeframes(b"\x00\x00" * 16000 * 2)
+        wav_file.writeframes(b"\x00\x00" * 16000 * duration_seconds)
 
     return {
         "scene_images_dir": str(images_dir),
@@ -98,9 +101,74 @@ def _ensure_fallback_artifacts(
         "engine": "fallback",
     }, {
         "audio_path": str(audio_path),
-        "duration_seconds": 2,
+        "duration_seconds": duration_seconds,
+        "script_word_count": word_count,
         "engine": "fallback",
     }
+
+
+def _consolidate_script_text(
+    script_result: Dict[str, Any] | None,
+    scene_plan: Dict[str, Any] | None,
+) -> str:
+    script_data = script_result if isinstance(script_result, dict) else {}
+    scene_data = scene_plan if isinstance(scene_plan, dict) else {}
+
+    scene_lines = []
+    scenes = scene_data.get("scenes") if isinstance(scene_data.get("scenes"), list) else []
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        heading = str(scene.get("heading") or "").strip()
+        visual = str(scene.get("visual") or "").strip()
+        combined = " — ".join([part for part in [heading, visual] if part])
+        if combined:
+            scene_lines.append(combined)
+
+    narration = str(script_data.get("narration") or "").strip()
+    lines = script_data.get("lines") if isinstance(script_data.get("lines"), list) else []
+    script_lines = [str(line).strip() for line in lines if str(line).strip()]
+
+    parts = []
+    if scene_lines:
+        parts.append("Scene Plan:\n" + "\n".join(f"- {line}" for line in scene_lines))
+    if narration:
+        parts.append("Narration:\n" + narration)
+    elif script_lines:
+        parts.append("Narration:\n" + "\n".join(script_lines))
+
+    return "\n\n".join([part for part in parts if part]).strip()
+
+
+def _ffmpeg_preflight() -> Dict[str, Any]:
+    ffmpeg_binary = shutil.which("ffmpeg")
+    path_value = _os.getenv("PATH", "")
+    details = {
+        "ffmpeg_path": ffmpeg_binary,
+        "PATH": path_value,
+    }
+
+    if not ffmpeg_binary:
+        details["message"] = (
+            "ffmpeg not found on PATH. Add packages.txt with `ffmpeg` at repo root and redeploy on Streamlit Cloud."
+        )
+        return {"ok": False, "details": details}
+
+    ffmpeg_version = subprocess.run(
+        [ffmpeg_binary, "-version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ffmpeg_version.returncode != 0:
+        details["message"] = (
+            f"ffmpeg -version failed ({ffmpeg_version.returncode}): {ffmpeg_version.stderr.strip()}"
+        )
+        return {"ok": False, "details": details}
+
+    first_line = (ffmpeg_version.stdout or "").splitlines()
+    details["version"] = first_line[0] if first_line else "unknown"
+    return {"ok": True, "details": details}
 
 
 def _collect_missing_artifacts(
@@ -158,10 +226,8 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
     bundle_data = bundle if isinstance(bundle, dict) else {}
 
     script_result = bundle_data.get("script") if isinstance(bundle_data.get("script"), dict) else {}
-    scene_plan = bundle_data.get("scene_plan") if isinstance(bundle_data.get("scene_plan"), dict) else {}
-    scenes = scene_plan.get("scenes") if isinstance(scene_plan.get("scenes"), list) else []
-    has_narration = bool(str(script_result.get("narration") or "").strip())
-    has_script = bool(scenes) and has_narration
+    script_text = str(script_result.get("text") or "").strip()
+    has_script = bool(script_text)
 
     image_result = bundle_data.get("images") if isinstance(bundle_data.get("images"), dict) else {}
     image_paths_raw = image_result.get("images") if isinstance(image_result.get("images"), list) else []
@@ -176,6 +242,9 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
     ).strip()
     has_audio = bool(audio_path) and Path(audio_path).exists()
 
+    ffmpeg_check = _ffmpeg_preflight()
+    has_ffmpeg = bool(ffmpeg_check.get("ok"))
+
     missing_labels: list[str] = []
     if not has_script:
         missing_labels.append("Script")
@@ -183,13 +252,17 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
         missing_labels.append("Images")
     if not has_audio:
         missing_labels.append("Audio")
+    if not has_ffmpeg:
+        missing_labels.append("ffmpeg")
 
     return {
         "has_script": has_script,
         "has_images": has_images,
         "has_audio": has_audio,
-        "ready_for_video": has_script and has_images and has_audio,
+        "has_ffmpeg": has_ffmpeg,
+        "ready_for_video": has_script and has_images and has_audio and has_ffmpeg,
         "missing_labels": missing_labels,
+        "ffmpeg_details": ffmpeg_check.get("details"),
     }
 
 
@@ -306,20 +379,10 @@ def _fallback_build_video_asset(
     missing_artifacts = _collect_missing_artifacts(image_result, audio_result)
     preflight_errors: list[str] = []
 
-    ffmpeg_binary = shutil.which("ffmpeg")
-    if not ffmpeg_binary:
-        preflight_errors.append("ffmpeg not found on PATH")
-    else:
-        ffmpeg_version = subprocess.run(
-            [ffmpeg_binary, "-version"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if ffmpeg_version.returncode != 0:
-            preflight_errors.append(
-                f"ffmpeg -version failed ({ffmpeg_version.returncode}): {ffmpeg_version.stderr.strip()}"
-            )
+    ffmpeg_check = _ffmpeg_preflight()
+    ffmpeg_binary = str((ffmpeg_check.get("details") or {}).get("ffmpeg_path") or "")
+    if not ffmpeg_check.get("ok"):
+        preflight_errors.append(str((ffmpeg_check.get("details") or {}).get("message") or "ffmpeg not available"))
 
     if missing_artifacts:
         preflight_errors.extend(missing_artifacts)
@@ -336,6 +399,10 @@ def _fallback_build_video_asset(
 
     if preflight_errors:
         video_result["error"] = "Preflight failed: " + " | ".join(preflight_errors)
+        video_result["error_details"] = {
+            "preflight_errors": preflight_errors,
+            "ffmpeg": ffmpeg_check.get("details"),
+        }
         return video_result
 
     base_video_dir = Path(audio_path).resolve().parent.parent / "video"
@@ -390,6 +457,11 @@ def _fallback_build_video_asset(
     if ffmpeg_run.returncode != 0:
         stderr = ffmpeg_run.stderr.strip() or "ffmpeg returned non-zero exit status"
         video_result["error"] = stderr
+        video_result["error_details"] = {
+            "ffmpeg_cmd": ffmpeg_cmd,
+            "stderr": ffmpeg_run.stderr,
+            "stdout": ffmpeg_run.stdout,
+        }
         raise RuntimeError(stderr)
 
     if not mp4_path.exists():
@@ -750,6 +822,12 @@ if "last_video" not in st.session_state:
     st.session_state["last_video"] = None
 if "last_bundle" not in st.session_state:
     st.session_state["last_bundle"] = None
+if "script_text" not in st.session_state:
+    st.session_state["script_text"] = ""
+if "generated_script_text" not in st.session_state:
+    st.session_state["generated_script_text"] = ""
+if "script_editor_text" not in st.session_state:
+    st.session_state["script_editor_text"] = ""
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -843,14 +921,23 @@ if run_button:
         try:
             script_result = engine.compile_voiceover_script(blueprint)
             scene_plan = engine.build_scene_plan(blueprint, script_result)
-            run_bundle["script"] = script_result
+            generated_script_text = _consolidate_script_text(script_result, scene_plan)
+            script_bundle = script_result if isinstance(script_result, dict) else {}
+            script_bundle["text"] = generated_script_text
+            script_bundle["scenes"] = (
+                scene_plan.get("scenes")
+                if isinstance(scene_plan, dict) and isinstance(scene_plan.get("scenes"), list)
+                else []
+            )
+            script_bundle["locked"] = False
+            run_bundle["script"] = script_bundle
             run_bundle["scene_plan"] = scene_plan
         except Exception as exc:
             _append_bundle_error(run_bundle, "script", exc)
             raise
 
         try:
-            image_result, audio_result = _ensure_fallback_artifacts(primary_topic, scene_plan)
+            image_result, audio_result = _ensure_fallback_artifacts(primary_topic, scene_plan, generated_script_text)
             run_bundle["images"] = image_result
             run_bundle["audio"] = audio_result
         except Exception as exc:
@@ -861,7 +948,10 @@ if run_button:
 
         st.session_state["last_dossier"] = dossier
         st.session_state["last_blueprint"] = blueprint
-        st.session_state["last_script"] = script_result
+        st.session_state["last_script"] = run_bundle.get("script")
+        st.session_state["script_text"] = generated_script_text
+        st.session_state["generated_script_text"] = generated_script_text
+        st.session_state["script_editor_text"] = generated_script_text
         st.session_state["last_scene_plan"] = scene_plan
         st.session_state["last_images"] = image_result
         st.session_state["last_audio"] = audio_result
@@ -919,8 +1009,6 @@ if dossier:
             url = str(s.get("url", ""))
             st.markdown(f"{i}. **{title}** — {url}")
 
-    st.subheader("Video Assembly")
-
     image_result = st.session_state.get("last_images")
     audio_result = st.session_state.get("last_audio")
     subtitles_result = st.session_state.get("last_subtitles")
@@ -936,14 +1024,79 @@ if dossier:
         "errors": [],
     }
 
+    script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
+    generated_script_text = str(script_bundle.get("text") or st.session_state.get("generated_script_text") or "").strip()
+    if not generated_script_text:
+        generated_script_text = _consolidate_script_text(script_bundle, scene_plan)
+
+    if not st.session_state.get("script_text"):
+        st.session_state["script_text"] = generated_script_text
+    if not st.session_state.get("generated_script_text"):
+        st.session_state["generated_script_text"] = generated_script_text
+    if not st.session_state.get("script_editor_text"):
+        st.session_state["script_editor_text"] = st.session_state.get("script_text", "")
+
+    current_script_text = str(st.session_state.get("script_text") or "").strip()
+    script_locked = bool(script_bundle.get("locked"))
+    script_bundle["text"] = current_script_text
+    script_bundle["scenes"] = (
+        scene_plan.get("scenes")
+        if isinstance(scene_plan, dict) and isinstance(scene_plan.get("scenes"), list)
+        else script_bundle.get("scenes") or []
+    )
+    script_bundle["locked"] = script_locked
+    bundle["script"] = script_bundle
+
+    st.subheader("Script")
+    st.text_area("Script (editable)", key="script_editor_text", height=400)
+
+    script_save_col, script_reset_col = st.columns(2)
+    if script_save_col.button("Save Script Changes", use_container_width=True):
+        edited_script = str(st.session_state.get("script_editor_text") or "").strip()
+        st.session_state["script_text"] = edited_script
+        bundle["script"]["text"] = edited_script
+        bundle["script"]["locked"] = True
+        try:
+            updated_images, updated_audio = _ensure_fallback_artifacts(primary_topic, scene_plan, edited_script)
+            st.session_state["last_images"] = updated_images
+            st.session_state["last_audio"] = updated_audio
+            bundle["images"] = updated_images
+            bundle["audio"] = updated_audio
+            st.success("Script changes saved. Audio regenerated from edited script.")
+        except Exception as exc:
+            _append_bundle_error(bundle, "script_save_audio_regeneration", exc)
+            st.error(f"Script saved, but audio regeneration failed: {exc}")
+
+    if script_reset_col.button("Reset to Generated Script", use_container_width=True):
+        reset_text = str(st.session_state.get("generated_script_text") or generated_script_text)
+        st.session_state["script_text"] = reset_text
+        st.session_state["script_editor_text"] = reset_text
+        bundle["script"]["text"] = reset_text
+        bundle["script"]["locked"] = False
+        st.info("Script reset to generated version.")
+
+    bundle["script"]["text"] = str(st.session_state.get("script_text") or "").strip()
+    bundle["script"]["locked"] = bool(bundle["script"].get("locked"))
+
+    st.subheader("Video Assembly")
+    ffmpeg_check = _ffmpeg_preflight()
+    if not ffmpeg_check.get("ok"):
+        ffmpeg_message = str((ffmpeg_check.get("details") or {}).get("message") or "ffmpeg not found on PATH")
+        video_bundle = bundle.get("video") if isinstance(bundle.get("video"), dict) else {}
+        video_bundle["error"] = "Preflight failed: ffmpeg not found on PATH"
+        video_bundle["error_details"] = ffmpeg_check.get("details")
+        bundle["video"] = video_bundle
+        st.error(ffmpeg_message)
+
     bundle["readiness"] = _artifact_readiness(bundle)
     readiness = bundle["readiness"]
     missing_labels = readiness.get("missing_labels") or []
 
     if missing_labels:
-        st.warning(
-            "Video Assembly is not ready. Missing: " + ", ".join(missing_labels)
-        )
+        st.warning("Video Assembly is not ready. Missing: " + ", ".join(missing_labels))
+
+    image_result = st.session_state.get("last_images")
+    audio_result = st.session_state.get("last_audio")
 
     if st.button("Assemble Video (MP4)", disabled=not readiness.get("ready_for_video", False)):
         try:
@@ -960,15 +1113,20 @@ if dossier:
             _append_bundle_error(bundle, "video_assembly", e)
             previous_video = st.session_state.get("last_video")
             last_error = str(e)
+            error_details = {"PATH": _os.getenv("PATH", "")}
             if isinstance(previous_video, dict):
                 prior_error = str(previous_video.get("error") or "").strip()
                 if prior_error:
                     last_error = prior_error
+                prior_details = previous_video.get("error_details")
+                if isinstance(prior_details, dict):
+                    error_details = prior_details
             st.session_state["last_video"] = {
                 "mode": "smoke-fallback" if SMOKE_MODE else "fallback",
                 "mp4_path": None,
                 "sha256": None,
                 "error": last_error,
+                "error_details": error_details,
             }
             bundle["video"] = st.session_state["last_video"]
             st.error(f"Video assembly failed: {last_error}")
@@ -981,6 +1139,7 @@ if dossier:
                 "mp4_path": video_result.get("mp4_path"),
                 "sha256": video_result.get("sha256"),
                 "error": video_result.get("error"),
+                "error_details": video_result.get("error_details"),
             }
         )
         mp4_path = str(video_result.get("mp4_path") or "").strip()
