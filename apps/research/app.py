@@ -18,6 +18,7 @@ import time
 import tempfile
 import base64
 import hashlib
+import re
 import inspect
 import importlib
 import shutil
@@ -256,18 +257,33 @@ def _collect_missing_artifacts(
         if missing_images:
             missing.append(f"image files not found: {', '.join(missing_images)}")
 
-    scene_mp3s = []
+    audio_path = ""
+    scene_mp3s: list[Dict[str, Any]] = []
     if isinstance(audio_result, dict):
-        raw = audio_result.get("scene_mp3s")
-        if isinstance(raw, list):
-            scene_mp3s = [item for item in raw if isinstance(item, dict)]
+        raw_scene_mp3s = audio_result.get("scene_mp3s")
+        if isinstance(raw_scene_mp3s, list):
+            scene_mp3s = [item for item in raw_scene_mp3s if isinstance(item, dict)]
+        audio_path = str(
+            audio_result.get("audio_path")
+            or audio_result.get("audio_mp3_path")
+            or ""
+        ).strip()
 
     if not scene_mp3s:
-        missing.append("scene mp3 list (bundle.audio.scene_mp3s)")
+        missing.append("scene mp3s (bundle.audio.scene_mp3s)")
     else:
-        missing_audio = [str(item.get("path") or "") for item in scene_mp3s if not Path(str(item.get("path") or "")).exists()]
-        if missing_audio:
-            missing.append(f"scene mp3 files not found: {', '.join(missing_audio)}")
+        missing_scene_files = [
+            str(item.get("audio_path") or "")
+            for item in scene_mp3s
+            if not Path(str(item.get("audio_path") or "")).exists()
+        ]
+        if missing_scene_files:
+            missing.append(f"scene audio files not found: {', '.join(missing_scene_files)}")
+
+    if not audio_path:
+        missing.append("assembled narration audio path (bundle.audio.audio_path)")
+    elif not Path(audio_path).exists():
+        missing.append(f"assembled narration audio file not found: {audio_path}")
 
     return missing
 
@@ -300,8 +316,24 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
     has_images = bool(image_paths) and all(Path(path).exists() for path in image_paths)
 
     audio_result = bundle_data.get("audio") if isinstance(bundle_data.get("audio"), dict) else {}
-    scene_mp3s = audio_result.get("scene_mp3s") if isinstance(audio_result.get("scene_mp3s"), list) else []
-    has_audio = bool(scene_mp3s) and all(Path(str(item.get("path") or "")).exists() for item in scene_mp3s if isinstance(item, dict))
+    scene_mp3s_raw = audio_result.get("scene_mp3s") if isinstance(audio_result.get("scene_mp3s"), list) else []
+    scene_mp3_paths = [
+        str(item.get("audio_path") or "").strip()
+        for item in scene_mp3s_raw
+        if isinstance(item, dict)
+    ]
+
+    audio_path = str(
+        audio_result.get("audio_path")
+        or audio_result.get("audio_mp3_path")
+        or ""
+    ).strip()
+    has_audio = (
+        bool(scene_mp3_paths)
+        and all(path and Path(path).exists() for path in scene_mp3_paths)
+        and bool(audio_path)
+        and Path(audio_path).exists()
+    )
 
     ffmpeg_check = _ffmpeg_preflight()
     has_ffmpeg = bool(ffmpeg_check.get("ok"))
@@ -397,95 +429,271 @@ def _fallback_compile_voiceover_script(blueprint: Dict[str, Any]) -> Dict[str, A
     }
 
 
+def _normalize_dossier_items(raw_value: Any) -> list[str]:
+    items: list[str] = []
+    if isinstance(raw_value, list):
+        for value in raw_value:
+            if isinstance(value, dict):
+                text = str(
+                    value.get("text")
+                    or value.get("event")
+                    or value.get("claim")
+                    or value.get("summary")
+                    or ""
+                ).strip()
+            else:
+                text = str(value).strip()
+            if text and text not in items:
+                items.append(text)
+    return items
+
+
+def _build_cited_sentence(statement: str, source_idx: int, lead_in: str) -> str:
+    safe_statement = re.sub(r"\s+", " ", statement).strip().rstrip(".")
+    return f"{lead_in} {safe_statement} (Source {source_idx})."
+
+
+def _pick_source_for_item(item: str, source_count: int, offset: int) -> int:
+    if source_count <= 0:
+        return 1
+    digest = hashlib.sha256(f"{item}|{offset}".encode("utf-8")).hexdigest()
+    return (int(digest[:8], 16) % source_count) + 1
+
+
+def _estimate_audio_duration_seconds(path: Path) -> float | None:
+    ffprobe_binary = shutil.which("ffprobe")
+    if not ffprobe_binary or not path.exists():
+        return None
+
+    run = subprocess.run(
+        [
+            ffprobe_binary,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if run.returncode != 0:
+        return None
+    try:
+        return float((run.stdout or "").strip())
+    except ValueError:
+        return None
+
+
 def _fallback_build_documentary_script(
     blueprint: Dict[str, Any],
     dossier: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     topic = str(blueprint.get("topic") or "this case").strip() or "this case"
     dossier_data = dossier if isinstance(dossier, dict) else {}
-
+    summary = str(dossier_data.get("summary") or blueprint.get("summary") or "").strip()
     sources = dossier_data.get("sources") if isinstance(dossier_data.get("sources"), list) else []
-    source_refs = []
-    for idx, source in enumerate(sources, start=1):
-        if not isinstance(source, dict):
-            continue
-        source_refs.append({
-            "index": idx,
-            "title": str(source.get("title") or f"Source {idx}"),
-            "url": str(source.get("url") or "").strip(),
-        })
-    if not source_refs:
-        source_refs = [{"index": 1, "title": "Source 1", "url": ""}]
 
-    pool: list[str] = []
-    for key in ("summary", "facts", "key_facts", "timeline", "claims", "contradictions", "open_questions", "notes"):
-        value = dossier_data.get(key)
-        if isinstance(value, list):
-            for item in value:
-                text = str(item.get("text") if isinstance(item, dict) else item).strip()
-                if text and text not in pool:
-                    pool.append(text)
-        elif isinstance(value, str):
-            text = value.strip()
-            if text and text not in pool:
-                pool.append(text)
-    if not pool:
-        pool = [
-            "The available dossier entries are limited, so all conclusions in this draft remain provisional.",
-            "Where details are incomplete, this narration labels them as unconfirmed rather than definitive.",
-            "Future updates should replace placeholders with direct quotations and dated records.",
-        ]
+    facts = _normalize_dossier_items(dossier_data.get("facts") or dossier_data.get("key_facts") or dossier_data.get("findings"))
+    timeline = _normalize_dossier_items(dossier_data.get("timeline") or dossier_data.get("chronology"))
+    claims = _normalize_dossier_items(dossier_data.get("claims"))
+    contradictions = _normalize_dossier_items(dossier_data.get("contradictions") or dossier_data.get("conflicts"))
+    notes = _normalize_dossier_items(dossier_data.get("notes"))
 
-    scene_count = 14
-    target_words_per_scene = max(320, TARGET_SCRIPT_WORDS // scene_count)
+    evidence_pool = [item for item in [summary, *facts, *timeline, *claims, *contradictions, *notes] if item]
+    if not evidence_pool:
+        evidence_pool = [f"The dossier on {topic} is available, but structured fact fields are sparse."]
+
+    scene_blueprint = [
+        "Hook: Why this case still matters",
+        "Timeline Start: First recorded events",
+        "Timeline Build: Events that escalated attention",
+        "What Primary Records Explicitly Show",
+        "Witness and Expert Accounts",
+        "Official Responses and Institutional Position",
+        "Competing Explanations",
+        "Evidence Quality Grading",
+        "Contradictions Inside the Record",
+        "What Is Supported vs. What Is Inferred",
+        "Persistent Unknowns",
+        "Closing: What Comes Next",
+    ]
+
+    scene_count = min(20, max(12, len(scene_blueprint)))
+    target_total_words = 7200
+    target_scene_words = max(360, target_total_words // scene_count)
+    source_count = max(1, len(sources))
+
+    lead_ins = [
+        "The dossier states",
+        "The documented record notes",
+        "Research notes indicate",
+        "One source summary reports",
+        "A corroborating entry explains",
+    ]
+
     scenes: list[Dict[str, Any]] = []
-
+    pool_index = 0
     for idx in range(scene_count):
-        scene_number = idx + 1
-        focus = [pool[(idx + o) % len(pool)] for o in range(4)]
-        citation_indices = sorted({((idx + o) % len(source_refs)) + 1 for o in range(3)})
-        source_cues = [source_refs[c - 1].get("url") or f"Source #{c}" for c in citation_indices]
+        scene_title = scene_blueprint[idx]
+        scene_target = target_scene_words + ((idx % 3) - 1) * 40
+        lines: list[str] = []
+        sources_used: set[int] = set()
 
-        paragraphs: list[str] = []
-        while len(" ".join(paragraphs).split()) < target_words_per_scene:
-            cidx = citation_indices[len(paragraphs) % len(citation_indices)]
-            point = focus[len(paragraphs) % len(focus)]
-            paragraphs.append(
-                f"For this chapter on {topic}, we anchor every claim to the dossier and identified records. "
-                f"The current evidence emphasizes: {point}. (Source {cidx}) "
-                "If a detail cannot be independently verified, we label it as unconfirmed and avoid escalating language."
-            )
-            paragraphs.append(
-                f"We then compare that entry against other claims, timeline notes, and contradictions in the same dossier. "
-                f"When records disagree, we preserve the disagreement instead of forcing certainty, and we keep the burden of proof visible. (Source {cidx})"
-            )
+        while len(" ".join(lines).split()) < scene_target:
+            datum = evidence_pool[pool_index % len(evidence_pool)]
+            source_idx = _pick_source_for_item(datum, source_count, idx + pool_index)
+            lead_in = lead_ins[(pool_index + idx) % len(lead_ins)]
+            lines.append(_build_cited_sentence(datum, source_idx, lead_in))
+            if (pool_index + idx) % 4 == 0:
+                lines.append(
+                    f"At this stage, the narration distinguishes direct evidence from interpretation so the audience can track certainty without losing the timeline (Source {source_idx})."
+                )
+            sources_used.add(source_idx)
+            pool_index += 1
 
-        voiceover = "\n\n".join(paragraphs).strip()
+        voiceover = " ".join(lines).strip()
         scenes.append(
             {
-                "scene_number": scene_number,
-                "scene_title": f"{topic} — Scene {scene_number}",
-                "visual_notes": "Archival pages, timeline graphics, map context, and labeled evidence overlays.",
-                "on_screen_text": [f"Scene {scene_number}", "Dossier-grounded narrative"],
+                "scene_number": idx + 1,
+                "scene_title": scene_title,
+                "visual_notes": (
+                    "Archival stills, timeline overlays, source callouts, and map/context imagery synchronized to cited dossier points."
+                ),
+                "on_screen_text": [
+                    f"Scene {idx + 1}: {scene_title}",
+                    f"Evidence references: {', '.join(f'Source {s}' for s in sorted(sources_used)[:3])}",
+                ],
                 "voiceover": voiceover,
-                "source_cues": source_cues,
+                "sources_used": sorted(sources_used),
             }
         )
 
-    narration_text = "\n\n".join(str(scene.get("voiceover") or "") for scene in scenes).strip()
+    narration_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes)
     word_count = len([token for token in narration_text.split() if token.strip()])
     return {
         "topic": topic,
         "scenes": scenes,
         "text": narration_text,
-        "target_minutes": TARGET_DOCUMENTARY_MINUTES,
-        "target_words": TARGET_SCRIPT_WORDS,
+        "word_count": word_count,
         "word_count_actual": word_count,
-        "based_on_sources": source_refs,
+        "estimated_minutes": round(word_count / 160.0, 2),
         "scene_count": len(scenes),
         "locked": False,
         "engine": "fallback",
     }
+
+
+def _generate_scene_mp3s(
+    bundle: Dict[str, Any],
+    openai_key: str,
+    tts_model: str = "gpt-4o-mini-tts",
+    tts_voice: str = "alloy",
+) -> Dict[str, Any]:
+    script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
+    scenes = script_bundle.get("scenes") if isinstance(script_bundle.get("scenes"), list) else []
+    if not scenes:
+        raise RuntimeError("Generate Script first to create scene voiceover blocks.")
+
+    if not openai_key.strip():
+        raise RuntimeError("OpenAI API key required for scene MP3 generation.")
+
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("OpenAI SDK is not installed; add `openai` to requirements.txt.") from exc
+
+    client = OpenAI(api_key=openai_key)
+    base_dir = (
+        Path(tempfile.gettempdir())
+        / "uappress_artifacts"
+        / str(st.session_state.get("last_run_ts") or int(time.time()))
+        / "audio"
+    )
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    scene_mp3s: list[Dict[str, Any]] = []
+    for idx, scene in enumerate(scenes, start=1):
+        if not isinstance(scene, dict):
+            continue
+        voiceover = str(scene.get("voiceover") or "").strip()
+        if not voiceover:
+            continue
+
+        cache_key = hashlib.sha256(f"{voiceover}|{tts_model}|{tts_voice}".encode("utf-8")).hexdigest()
+        output_path = base_dir / f"scene_{idx:02d}.mp3"
+        cache_path = base_dir / f"scene_{idx:02d}.sha256"
+
+        cached_hash = cache_path.read_text(encoding="utf-8").strip() if cache_path.exists() else ""
+        if not output_path.exists() or cached_hash != cache_key:
+            response = client.audio.speech.create(model=tts_model, voice=tts_voice, input=voiceover)
+            response.stream_to_file(str(output_path))
+            cache_path.write_text(cache_key, encoding="utf-8")
+
+        duration_sec = _estimate_audio_duration_seconds(output_path)
+        scene["audio_path"] = str(output_path)
+        scene["audio_duration_sec"] = duration_sec
+        scene_mp3s.append(
+            {
+                "scene_number": idx,
+                "audio_path": str(output_path),
+                "audio_duration_sec": duration_sec,
+            }
+        )
+
+    ffmpeg_binary = shutil.which("ffmpeg")
+    merged_path = base_dir / "full_narration.mp3"
+    if ffmpeg_binary and scene_mp3s:
+        concat_manifest = base_dir / "scene_audio_concat.txt"
+        concat_manifest.write_text(
+            "\n".join(f"file '{Path(item['audio_path']).resolve().as_posix()}'" for item in scene_mp3s) + "\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                ffmpeg_binary,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_manifest),
+                "-c",
+                "copy",
+                str(merged_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    total_duration = sum(float(item.get("audio_duration_sec") or 0.0) for item in scene_mp3s)
+    audio_bundle = {
+        "scene_mp3s": scene_mp3s,
+        "audio_path": str(merged_path) if merged_path.exists() else "",
+        "duration_seconds": total_duration,
+        "engine": "openai-tts",
+    }
+    bundle["audio"] = audio_bundle
+    return audio_bundle
+
+
+def generate_script(dossier: Dict[str, Any] | None, blueprint: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(dossier, dict) or not dossier:
+        raise RuntimeError("Run Research first")
+    blueprint_data = blueprint if isinstance(blueprint, dict) else _fallback_build_documentary_blueprint(dossier)
+    result = _fallback_build_documentary_script(blueprint_data, dossier)
+    scenes = result.get("scenes") if isinstance(result.get("scenes"), list) else []
+    text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes if isinstance(scene, dict))
+    word_count_actual = len([token for token in text.split() if token.strip()])
+    result["text"] = text
+    result["word_count_actual"] = word_count_actual
+    result["estimated_minutes"] = round(word_count_actual / 160.0, 2)
+    return result
 
 
 def _fallback_build_scene_plan(blueprint: Dict[str, Any], script_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -1090,47 +1298,22 @@ if run_button:
             _append_bundle_error(run_bundle, "blueprint", exc)
             raise
 
-        try:
-            if getattr(engine, "build_documentary_script", None) is not None:
-                script_result = engine.build_documentary_script(blueprint, dossier)
-            else:
-                script_result = engine.compile_voiceover_script(blueprint)
-
-            scene_plan = engine.build_scene_plan(blueprint, script_result)
-            generated_script_text = _consolidate_script_text(script_result, scene_plan)
-            script_bundle = script_result if isinstance(script_result, dict) else {}
-            script_bundle["text"] = generated_script_text
-            script_bundle["scenes"] = (
-                script_bundle.get("scenes")
-                if isinstance(script_bundle.get("scenes"), list)
-                else []
-            )
-            script_bundle["locked"] = False
-            run_bundle["script"] = script_bundle
-            run_bundle["scene_plan"] = scene_plan
-        except Exception as exc:
-            _append_bundle_error(run_bundle, "script", exc)
-            raise
-
-        try:
-            image_result, audio_result = _ensure_fallback_artifacts(primary_topic, scene_plan, generated_script_text)
-            run_bundle["images"] = image_result
-            run_bundle["audio"] = audio_result
-        except Exception as exc:
-            _append_bundle_error(run_bundle, "assets", exc)
-            raise
+        run_bundle["script"] = {"text": "", "scenes": [], "locked": False}
+        run_bundle["scene_plan"] = {"scene_count": 0, "scenes": [], "engine": "pending"}
+        run_bundle["images"] = {"images": [], "image_count": 0, "engine": "pending"}
+        run_bundle["audio"] = {"scene_mp3s": [], "audio_path": "", "duration_seconds": 0, "engine": "pending"}
 
         run_bundle["readiness"] = _artifact_readiness(run_bundle)
 
         st.session_state["last_dossier"] = dossier
         st.session_state["last_blueprint"] = blueprint
         st.session_state["last_script"] = run_bundle.get("script")
-        st.session_state["script_text"] = generated_script_text
-        st.session_state["generated_script_text"] = generated_script_text
-        st.session_state["script_editor_text"] = generated_script_text
-        st.session_state["last_scene_plan"] = scene_plan
-        st.session_state["last_images"] = image_result
-        st.session_state["last_audio"] = audio_result
+        st.session_state["script_text"] = ""
+        st.session_state["generated_script_text"] = ""
+        st.session_state["script_editor_text"] = ""
+        st.session_state["last_scene_plan"] = run_bundle.get("scene_plan")
+        st.session_state["last_images"] = run_bundle.get("images")
+        st.session_state["last_audio"] = run_bundle.get("audio")
         st.session_state["last_bundle"] = run_bundle
         st.session_state["run_status"] = "DONE"
 
@@ -1169,16 +1352,6 @@ if dossier:
     st.subheader("Dossier Output")
     st.json(dossier)
 
-    if (
-        st.session_state.get("last_script_result") is None
-        and engine.build_documentary_blueprint is not None
-    ):
-        blueprint = engine.build_documentary_blueprint(dossier)
-        if getattr(engine, "build_documentary_script", None) is not None:
-            st.session_state["last_script_result"] = engine.build_documentary_script(blueprint, dossier)
-        elif engine.compile_voiceover_script is not None:
-            st.session_state["last_script_result"] = engine.compile_voiceover_script(blueprint)
-
     sources = dossier.get("sources") or []
     if isinstance(sources, list) and sources:
         st.subheader("Top Sources")
@@ -1203,85 +1376,107 @@ if dossier:
     }
 
     script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
+    script_scenes = script_bundle.get("scenes") if isinstance(script_bundle.get("scenes"), list) else []
     generated_script_text = str(script_bundle.get("text") or st.session_state.get("generated_script_text") or "").strip()
-    if not generated_script_text:
-        generated_script_text = _consolidate_script_text(script_bundle, scene_plan)
+    if not generated_script_text and script_scenes:
+        generated_script_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in script_scenes if isinstance(scene, dict))
 
-    if not st.session_state.get("script_text"):
+    if "script_text" not in st.session_state:
         st.session_state["script_text"] = generated_script_text
-    if not st.session_state.get("generated_script_text"):
+    if "generated_script_text" not in st.session_state:
         st.session_state["generated_script_text"] = generated_script_text
-    if not st.session_state.get("script_editor_text"):
+    if "script_editor_text" not in st.session_state:
         st.session_state["script_editor_text"] = st.session_state.get("script_text", "")
 
-    current_script_text = str(st.session_state.get("script_text") or "").strip()
-    script_locked = bool(script_bundle.get("locked"))
-    script_bundle["text"] = current_script_text
-    script_bundle["scenes"] = (
-        script_bundle.get("scenes")
-        if isinstance(script_bundle.get("scenes"), list)
-        else []
-    )
-    script_bundle["locked"] = script_locked
-    bundle["script"] = script_bundle
-
     st.subheader("Script")
-    gen_col, overwrite_col = st.columns(2)
+    gen_col, save_col, reset_col, regen_col = st.columns(4)
+
     if gen_col.button("Generate Script", use_container_width=True):
-        generated = generate_script(bundle, overwrite=False)
-        if generated is None:
-            st.warning("Run Research first")
-        elif bool(bundle.get("script", {}).get("locked")):
-            st.warning("Script is locked. Use Overwrite Generated Script to regenerate.")
-        else:
-            generated_text = str(generated.get("text") or "")
-            st.session_state["last_script"] = generated
-            st.session_state["script_text"] = generated_text
-            st.session_state["generated_script_text"] = generated_text
-            st.session_state["script_editor_text"] = generated_text
-            st.session_state["last_scene_plan"] = bundle.get("scene_plan")
-            st.success("Script generated from dossier.")
-
-    if overwrite_col.button("Overwrite Generated Script", use_container_width=True):
-        generated = generate_script(bundle, overwrite=True)
-        if generated is None:
+        if not dossier:
             st.warning("Run Research first")
         else:
-            generated_text = str(generated.get("text") or "")
-            st.session_state["last_script"] = generated
-            st.session_state["script_text"] = generated_text
-            st.session_state["generated_script_text"] = generated_text
-            st.session_state["script_editor_text"] = generated_text
-            st.session_state["last_scene_plan"] = bundle.get("scene_plan")
-            st.success("Script overwritten and regenerated.")
+            script_generated = generate_script(dossier, blueprint)
+            scenes = script_generated.get("scenes") if isinstance(script_generated.get("scenes"), list) else []
+            script_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes if isinstance(scene, dict))
+            script_generated["text"] = script_text
+            script_generated["word_count_actual"] = len([w for w in script_text.split() if w.strip()])
+            script_generated["estimated_minutes"] = round(script_generated["word_count_actual"] / 160.0, 2)
+            script_generated["locked"] = False
+            bundle["script"] = script_generated
+            bundle["scene_plan"] = engine.build_scene_plan(blueprint, script_generated)
+            st.session_state["last_script"] = script_generated
+            st.session_state["last_scene_plan"] = bundle["scene_plan"]
+            st.session_state["generated_script_text"] = script_text
+            st.session_state["script_text"] = script_text
+            st.session_state["script_editor_text"] = script_text
+            updated_images, _ = _ensure_fallback_artifacts(primary_topic, bundle["scene_plan"], script_text)
+            bundle["images"] = updated_images
+            st.session_state["last_images"] = updated_images
+            bundle["audio"] = {"scene_mp3s": [], "audio_path": "", "duration_seconds": 0, "engine": "pending"}
+            st.session_state["last_audio"] = bundle["audio"]
+            st.success("Generated scene-based documentary script.")
 
-    script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
-    if script_bundle.get("text"):
-        word_count_actual = int(script_bundle.get("word_count_actual") or len(str(script_bundle.get("text") or "").split()))
-        runtime_min = round(word_count_actual / WORDS_PER_MINUTE, 1)
-        st.caption(f"Word count: {word_count_actual} | Estimated runtime: {runtime_min} min")
-
-    st.text_area("Script (editable)", key="script_editor_text", height=400)
-
-    script_save_col, script_reset_col = st.columns(2)
-    if script_save_col.button("Save Script Changes", use_container_width=True):
+    if save_col.button("Save Script Changes", use_container_width=True):
         edited_script = str(st.session_state.get("script_editor_text") or "").strip()
         st.session_state["script_text"] = edited_script
-        bundle["script"]["text"] = edited_script
-        bundle["script"]["word_count_actual"] = len(edited_script.split())
+        bundle.setdefault("script", {})["text"] = edited_script
         bundle["script"]["locked"] = True
-        st.success("Script changes saved. Script locked.")
+        st.success("Script changes saved.")
 
-    if script_reset_col.button("Reset to Generated Script", use_container_width=True):
-        reset_text = str(st.session_state.get("generated_script_text") or generated_script_text)
+    if reset_col.button("Reset to Generated Script", use_container_width=True):
+        reset_text = str(st.session_state.get("generated_script_text") or "")
         st.session_state["script_text"] = reset_text
         st.session_state["script_editor_text"] = reset_text
-        bundle["script"]["text"] = reset_text
+        bundle.setdefault("script", {})["text"] = reset_text
         bundle["script"]["locked"] = False
         st.info("Script reset to generated version.")
 
-    bundle["script"]["text"] = str(st.session_state.get("script_text") or "").strip()
-    bundle["script"]["locked"] = bool(bundle["script"].get("locked"))
+    if regen_col.button("Regenerate Script (Overwrite)", use_container_width=True, disabled=not bool(bundle.get("script", {}).get("locked"))):
+        script_generated = generate_script(dossier, blueprint)
+        scenes = script_generated.get("scenes") if isinstance(script_generated.get("scenes"), list) else []
+        script_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes if isinstance(scene, dict))
+        script_generated["text"] = script_text
+        script_generated["word_count_actual"] = len([w for w in script_text.split() if w.strip()])
+        script_generated["estimated_minutes"] = round(script_generated["word_count_actual"] / 160.0, 2)
+        script_generated["locked"] = False
+        bundle["script"] = script_generated
+        bundle["scene_plan"] = engine.build_scene_plan(blueprint, script_generated)
+        st.session_state["generated_script_text"] = script_text
+        st.session_state["script_text"] = script_text
+        st.session_state["script_editor_text"] = script_text
+        st.session_state["last_script"] = script_generated
+        st.session_state["last_scene_plan"] = bundle["scene_plan"]
+        st.success("Script regenerated and overwrite complete.")
+
+    st.text_area("Script (editable)", key="script_editor_text", height=400)
+    bundle.setdefault("script", {})["text"] = str(st.session_state.get("script_editor_text") or "").strip()
+
+    st.subheader("Audio")
+    scenes_exist = bool(bundle.get("script", {}).get("scenes"))
+    if st.button("Generate MP3s (per scene)", disabled=not scenes_exist, use_container_width=True):
+        try:
+            audio_bundle = _generate_scene_mp3s(bundle, openai_key=openai_key or "")
+            st.session_state["last_audio"] = audio_bundle
+            st.success(f"Generated {len(audio_bundle.get('scene_mp3s') or [])} scene MP3 files.")
+        except Exception as exc:
+            _append_bundle_error(bundle, "scene_tts", exc)
+            st.error(str(exc))
+
+    audio_bundle = bundle.get("audio") if isinstance(bundle.get("audio"), dict) else {}
+    scene_mp3s = audio_bundle.get("scene_mp3s") if isinstance(audio_bundle.get("scene_mp3s"), list) else []
+    st.caption(f"Audio status: {len(scene_mp3s)} scene mp3s")
+    for item in scene_mp3s[:3]:
+        if not isinstance(item, dict):
+            continue
+        audio_path = str(item.get("audio_path") or "")
+        if audio_path and Path(audio_path).exists():
+            st.audio(audio_path)
+
+    if scene_mp3s:
+        st.markdown("**Scene MP3 files**")
+        for item in scene_mp3s:
+            if isinstance(item, dict):
+                st.code(str(item.get("audio_path") or ""))
 
     st.subheader("Audio (Per-Scene TTS)")
     if st.button("Generate MP3s (per scene)", use_container_width=True):
