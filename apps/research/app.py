@@ -18,6 +18,7 @@ import time
 import tempfile
 import base64
 import inspect
+import importlib
 import wave
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime
@@ -33,6 +34,9 @@ except Exception:
 
 # Import marker must always exist for Streamlit Cloud import safety.
 ENGINE_IMPORT_MARKER = "TEST_HOOK:ENGINE_IMPORT_FALLBACK"
+ENGINE_IMPORT_STATUS = "FALLBACK"
+ENGINE_IMPORT_EXCEPTION: BaseException | None = None
+ENGINE_IMPORT_EXCEPTION_TRACE = ""
 _MINIMAL_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAZAAAADICAIAAABJdyC1AAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJ"
     "bWFnZVJlYWR5ccllPAAAABh0RVh0Q3JlYXRpb24gVGltZQAwMi8xOC8yNvVhXxkAAABBSURBVHja"
@@ -251,13 +255,59 @@ class EngineSurface:
 # Import-time safe research function
 # ------------------------------------------------------------------------------
 ENGINE_IMPORT_OK = False
-try:
-    from apps.research.uappress_engine_v9 import run_research  # type: ignore
-    ENGINE_IMPORT_OK = True
-    ENGINE_IMPORT_MARKER = "TEST_HOOK:ENGINE_IMPORT_OK"
-except Exception:
-    ENGINE_IMPORT_OK = False
+ENGINE_IMPORT_TARGET = ""
 
+_engine_module = None
+_engine_run_research = None
+_engine_research_job = None
+_import_failures: list[str] = []
+
+for module_name in (
+    "apps.research.uappress_engine_v9",
+    "apps.research.research_engine",
+    "uappress_engine_v9",
+    "research_engine",
+):
+    try:
+        candidate = importlib.import_module(module_name)
+        candidate_run = getattr(candidate, "run_research")
+    except Exception as exc:
+        _import_failures.append(f"{module_name}: {type(exc).__name__}: {exc}")
+        continue
+
+    _engine_module = candidate
+    _engine_run_research = candidate_run
+    _engine_research_job = getattr(candidate, "ResearchJob", None)
+    ENGINE_IMPORT_OK = True
+    ENGINE_IMPORT_TARGET = module_name
+    break
+
+if ENGINE_IMPORT_OK:
+    run_research = _engine_run_research  # type: ignore[assignment]
+
+    if _engine_research_job is None:
+        @dataclass
+        class ResearchJob:  # type: ignore
+            primary_topic: str
+    else:
+        ResearchJob = _engine_research_job  # type: ignore[assignment]
+
+    def _run_research_adapter(**kwargs: Any) -> Dict[str, Any]:
+        call_kwargs = dict(kwargs)
+        if "job" in call_kwargs and "primary_topic" not in call_kwargs:
+            job_value = call_kwargs.pop("job")
+            call_kwargs["primary_topic"] = str(
+                getattr(job_value, "primary_topic", "")
+            ).strip()
+        return _engine_run_research(**call_kwargs)  # type: ignore[misc]
+
+    run_research = _run_research_adapter
+    ENGINE_IMPORT_STATUS = "PRIMARY"
+    ENGINE_IMPORT_MARKER = "TEST_HOOK:ENGINE_IMPORT_PRIMARY"
+else:
+    ENGINE_IMPORT_EXCEPTION_TRACE = " | ".join(_import_failures) or "No import attempts recorded."
+
+if not ENGINE_IMPORT_OK:
     @st.cache_data(show_spinner=False)
     def _fallback_job_type() -> str:
         return "fallback"
@@ -275,10 +325,6 @@ except Exception:
             "args": {k: ("***" if "key" in k.lower() else v) for k, v in kwargs.items()},
             "job_type": _fallback_job_type(),
         }
-
-    @dataclass
-    class ResearchJob:  # type: ignore[no-redef]
-        primary_topic: str
 
 
 engine = EngineSurface(
@@ -466,7 +512,15 @@ with st.sidebar:
         include_gov_docs = True
 
     st.divider()
-    st.caption(f"ENGINE_IMPORT: {'OK' if ENGINE_IMPORT_OK else 'FALLBACK'}")
+    st.caption(f"ENGINE_IMPORT: {ENGINE_IMPORT_STATUS}")
+    if ENGINE_IMPORT_STATUS == "FALLBACK":
+        st.caption(
+            "ENGINE_IMPORT_EXCEPTION: "
+            + (
+                ENGINE_IMPORT_EXCEPTION_TRACE
+                or "Unavailable (no exception details captured)."
+            )
+        )
     st.caption(f"APP_FILE: {__file__}")
 
     st.divider()
@@ -702,6 +756,8 @@ if dossier:
 
     bundle_payload = {
         "dossier": dossier,
+        "blueprint": blueprint,
+        "script": script_result,
         "scene_plan": scene_plan,
         "images": image_result,
         "audio": audio_result,
