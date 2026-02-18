@@ -17,8 +17,11 @@ import os as _os
 import time
 import tempfile
 import base64
+import hashlib
 import inspect
 import importlib
+import shutil
+import subprocess
 import wave
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime
@@ -231,8 +234,44 @@ def _fallback_build_video_asset(
     scene_plan: Dict[str, Any],
     smoke: bool = False,
 ) -> Dict[str, Any]:
-    return {
-        "mode": "smoke-fallback" if smoke else "fallback",
+    mode = "smoke-fallback" if smoke else "fallback"
+    image_paths = []
+    if isinstance(image_result, dict):
+        candidate_paths = image_result.get("images")
+        if isinstance(candidate_paths, list):
+            image_paths = [str(path).strip() for path in candidate_paths if str(path).strip()]
+
+    audio_path = ""
+    if isinstance(audio_result, dict):
+        audio_path = str(
+            audio_result.get("audio_path")
+            or audio_result.get("audio_mp3_path")
+            or ""
+        ).strip()
+
+    missing_artifacts = _collect_missing_artifacts(image_result, audio_result)
+    preflight_errors: list[str] = []
+
+    ffmpeg_binary = shutil.which("ffmpeg")
+    if not ffmpeg_binary:
+        preflight_errors.append("ffmpeg not found on PATH")
+    else:
+        ffmpeg_version = subprocess.run(
+            [ffmpeg_binary, "-version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if ffmpeg_version.returncode != 0:
+            preflight_errors.append(
+                f"ffmpeg -version failed ({ffmpeg_version.returncode}): {ffmpeg_version.stderr.strip()}"
+            )
+
+    if missing_artifacts:
+        preflight_errors.extend(missing_artifacts)
+
+    video_result: Dict[str, Any] = {
+        "mode": mode,
         "mp4_path": None,
         "sha256": None,
         "scene_count": int(scene_plan.get("scene_count") or 0),
@@ -240,6 +279,74 @@ def _fallback_build_video_asset(
         "has_audio": bool(audio_result),
         "has_subtitles": bool(subtitles_result),
     }
+
+    if preflight_errors:
+        video_result["error"] = "Preflight failed: " + " | ".join(preflight_errors)
+        return video_result
+
+    base_video_dir = Path(audio_path).resolve().parent.parent / "video"
+    base_video_dir.mkdir(parents=True, exist_ok=True)
+    mp4_path = base_video_dir / "fallback_assembly.mp4"
+    concat_file = base_video_dir / "fallback_images.txt"
+
+    # Keep each scene on screen long enough to cover the audio duration.
+    per_scene_duration = 2.0
+    if isinstance(audio_result, dict):
+        duration_seconds = float(audio_result.get("duration_seconds") or 0)
+        if duration_seconds > 0 and image_paths:
+            per_scene_duration = max(0.5, duration_seconds / len(image_paths))
+
+    concat_lines: list[str] = []
+    for image_path in image_paths:
+        resolved = Path(image_path).resolve()
+        concat_lines.append(f"file '{resolved.as_posix()}'")
+        concat_lines.append(f"duration {per_scene_duration:.3f}")
+    # Repeat final frame per ffmpeg concat demuxer requirements.
+    concat_lines.append(f"file '{Path(image_paths[-1]).resolve().as_posix()}'")
+    concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+    ffmpeg_cmd = [
+        str(ffmpeg_binary),
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_file),
+        "-i",
+        audio_path,
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-shortest",
+        str(mp4_path),
+    ]
+
+    ffmpeg_run = subprocess.run(
+        ffmpeg_cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if ffmpeg_run.returncode != 0:
+        stderr = ffmpeg_run.stderr.strip() or "ffmpeg returned non-zero exit status"
+        video_result["error"] = stderr
+        raise RuntimeError(stderr)
+
+    if not mp4_path.exists():
+        error_message = f"ffmpeg reported success but output file missing: {mp4_path}"
+        video_result["error"] = error_message
+        raise RuntimeError(error_message)
+
+    digest = hashlib.sha256(mp4_path.read_bytes()).hexdigest()
+    video_result["mp4_path"] = str(mp4_path)
+    video_result["sha256"] = digest
+    return video_result
 
 
 @dataclass
@@ -742,7 +849,19 @@ if dossier:
                 )
                 st.success("Video assembly complete.")
             except Exception as e:
-                st.error(f"Video assembly failed: {str(e)}")
+                previous_video = st.session_state.get("last_video")
+                last_error = str(e)
+                if isinstance(previous_video, dict):
+                    prior_error = str(previous_video.get("error") or "").strip()
+                    if prior_error:
+                        last_error = prior_error
+                st.session_state["last_video"] = {
+                    "mode": "smoke-fallback" if SMOKE_MODE else "fallback",
+                    "mp4_path": None,
+                    "sha256": None,
+                    "error": last_error,
+                }
+                st.error(f"Video assembly failed: {last_error}")
 
     video_result = st.session_state.get("last_video")
     if video_result:
@@ -751,8 +870,12 @@ if dossier:
                 "mode": video_result.get("mode"),
                 "mp4_path": video_result.get("mp4_path"),
                 "sha256": video_result.get("sha256"),
+                "error": video_result.get("error"),
             }
         )
+        mp4_path = str(video_result.get("mp4_path") or "").strip()
+        if mp4_path and Path(mp4_path).exists():
+            st.video(mp4_path)
 
     bundle_payload = {
         "dossier": dossier,
