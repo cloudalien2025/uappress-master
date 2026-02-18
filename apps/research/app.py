@@ -154,7 +154,7 @@ def _consolidate_script_text(
 
 
 
-def generate_script(bundle: Dict[str, Any], *, overwrite: bool = False) -> Dict[str, Any] | None:
+def _generate_script_legacy(bundle: Dict[str, Any], *, overwrite: bool = False) -> Dict[str, Any] | None:
     dossier = bundle.get("dossier") if isinstance(bundle.get("dossier"), dict) else None
     if not dossier:
         return None
@@ -201,9 +201,29 @@ def generate_scene_mp3s(bundle: Dict[str, Any], *, openai_key: str, voice: str =
         scene["audio_duration_sec"] = duration_sec
         scene_mp3s.append({"scene": idx, "path": str(target), "duration_sec": duration_sec})
 
-    audio_bundle.update({"scene_mp3s": scene_mp3s, "format": "mp3", "voice": voice, "model": model, "cache": cache})
+    merged_audio_path = ""
+    ffmpeg_binary = shutil.which("ffmpeg")
+    if ffmpeg_binary and scene_mp3s:
+        manifest = audio_dir / "scene_audio_concat.txt"
+        manifest.write_text("\n".join([f"file '{Path(item['path']).resolve().as_posix()}'" for item in scene_mp3s]) + "\n", encoding="utf-8")
+        merged_target = audio_dir / "full_narration.mp3"
+        run = subprocess.run([ffmpeg_binary, "-y", "-f", "concat", "-safe", "0", "-i", str(manifest), "-c", "copy", str(merged_target)], capture_output=True, text=True, check=False)
+        if run.returncode == 0 and merged_target.exists():
+            merged_audio_path = str(merged_target)
+
+    total_duration = round(sum(float(item.get("duration_sec") or 0.0) for item in scene_mp3s), 2)
+    audio_bundle.update({
+        "scene_mp3s": scene_mp3s,
+        "audio_path": merged_audio_path,
+        "duration_seconds": total_duration,
+        "format": "mp3",
+        "voice": voice,
+        "model": model,
+        "cache": cache,
+    })
     bundle["audio"] = audio_bundle
     bundle["script"]["scenes"] = scenes
+    bundle["timing"] = build_timing_map(scenes)
     return audio_bundle
 
 
@@ -273,9 +293,9 @@ def _collect_missing_artifacts(
         missing.append("scene mp3s (bundle.audio.scene_mp3s)")
     else:
         missing_scene_files = [
-            str(item.get("audio_path") or "")
+            str(item.get("audio_path") or item.get("path") or "")
             for item in scene_mp3s
-            if not Path(str(item.get("audio_path") or "")).exists()
+            if not Path(str(item.get("audio_path") or item.get("path") or "")).exists()
         ]
         if missing_scene_files:
             missing.append(f"scene audio files not found: {', '.join(missing_scene_files)}")
@@ -318,7 +338,7 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
     audio_result = bundle_data.get("audio") if isinstance(bundle_data.get("audio"), dict) else {}
     scene_mp3s_raw = audio_result.get("scene_mp3s") if isinstance(audio_result.get("scene_mp3s"), list) else []
     scene_mp3_paths = [
-        str(item.get("audio_path") or "").strip()
+        str(item.get("audio_path") or item.get("path") or "").strip()
         for item in scene_mp3s_raw
         if isinstance(item, dict)
     ]
@@ -446,6 +466,142 @@ def _normalize_dossier_items(raw_value: Any) -> list[str]:
             if text and text not in items:
                 items.append(text)
     return items
+
+
+def _source_tier(url: str) -> int:
+    host = (url or "").lower()
+    if ".gov" in host or ".edu" in host:
+        return 1
+    if any(domain in host for domain in ["reuters.com", "apnews.com", "nytimes.com", "wsj.com", "bbc.", "cnn.com"]):
+        return 1
+    if any(domain in host for domain in ["reddit.com", "blog", "substack.com", "medium.com"]):
+        return 3
+    return 2
+
+
+def _source_domain(url: str) -> str:
+    match = re.search(r"https?://([^/]+)", url or "")
+    return (match.group(1).lower() if match else (url or "").lower()).replace("www.", "")
+
+
+def build_fact_pack(dossier: Dict[str, Any]) -> Dict[str, Any]:
+    topic = str(dossier.get("topic") or dossier.get("primary_topic") or "Untitled Topic").strip()
+    raw_sources = dossier.get("sources") if isinstance(dossier.get("sources"), list) else []
+    unique_domains: set[str] = set()
+    sources_used: list[Dict[str, Any]] = []
+    gaps: list[str] = []
+
+    for source in raw_sources:
+        if not isinstance(source, dict):
+            continue
+        url = str(source.get("url") or "").strip()
+        title = str(source.get("title") or "Untitled source").strip()
+        domain = _source_domain(url)
+        tier = _source_tier(url)
+        if domain in unique_domains and tier == 3:
+            continue
+        unique_domains.add(domain)
+        sources_used.append({"idx": len(sources_used) + 1, "title": title, "url": url, "tier": tier})
+
+    def _pick_idx(text: str) -> int:
+        if not sources_used:
+            return 0
+        return _pick_source_for_item(text, len(sources_used), 0)
+
+    timeline_items = _normalize_dossier_items(dossier.get("timeline") or dossier.get("chronology"))
+    timeline_events = [
+        {
+            "date": "Unknown",
+            "time": "Unknown",
+            "location": "Unspecified",
+            "event": item,
+            "source_idx": _pick_idx(item),
+            "confidence": 0.65,
+        }
+        for item in timeline_items
+    ]
+
+    claim_items = _normalize_dossier_items(dossier.get("claims") or dossier.get("facts") or dossier.get("findings"))
+    key_claims = [
+        {
+            "claim": item,
+            "claimant": "Dossier record",
+            "evidence": "Primary dossier entry",
+            "source_idx": _pick_idx(item),
+            "confidence": 0.68,
+        }
+        for item in claim_items
+    ]
+
+    witness_accounts = [
+        {
+            "witness": "Documented witness",
+            "summary": item,
+            "source_idx": _pick_idx(item),
+            "confidence": 0.6,
+        }
+        for item in _normalize_dossier_items(dossier.get("witness_accounts") or dossier.get("notes"))[:6]
+    ]
+
+    official_positions = [
+        {
+            "agency": "Official channel",
+            "statement": item,
+            "source_idx": _pick_idx(item),
+            "confidence": 0.7,
+        }
+        for item in _normalize_dossier_items(dossier.get("official_positions") or dossier.get("summary"))[:4]
+    ]
+
+    skeptical_explanations = [
+        {"explanation": item, "supporting_sources": [_pick_idx(item)], "confidence": 0.55}
+        for item in _normalize_dossier_items(dossier.get("skeptical_explanations") or dossier.get("alternatives"))[:5]
+    ]
+
+    contradiction_items = _normalize_dossier_items(dossier.get("contradictions") or dossier.get("conflicts"))
+    contradictions = []
+    for idx, item in enumerate(contradiction_items):
+        claims = [part.strip() for part in re.split(r"\bbut\b|\bhowever\b|\bvs\.?\b", item, flags=re.IGNORECASE) if part.strip()]
+        claim_a = claims[0] if claims else item
+        claim_b = claims[1] if len(claims) > 1 else "Counterclaim remains unresolved"
+        contradictions.append(
+            {
+                "claim_a": claim_a,
+                "claim_b": claim_b,
+                "analysis": "Both claims appear in the record and require stronger corroboration.",
+                "source_indices": [_pick_idx(claim_a), _pick_idx(claim_b)],
+            }
+        )
+
+    quote_bank = [
+        {"quote": item, "speaker": "Record excerpt", "source_idx": _pick_idx(item)}
+        for item in _normalize_dossier_items(dossier.get("quotes") or dossier.get("notes"))[:10]
+    ]
+    unknowns = [
+        {"question": item, "why_unknown": "Current source set does not close this gap."}
+        for item in _normalize_dossier_items(dossier.get("unknowns") or dossier.get("open_questions"))[:8]
+    ]
+
+    if not sources_used:
+        gaps.append("No usable sources extracted from dossier.sources")
+    if not timeline_events:
+        gaps.append("No timeline events extracted")
+    if not key_claims:
+        gaps.append("No key claims extracted")
+
+    return {
+        "topic": topic,
+        "sources_used": sources_used,
+        "timeline_events": timeline_events,
+        "key_claims": key_claims,
+        "witness_accounts": witness_accounts,
+        "official_positions": official_positions,
+        "skeptical_explanations": skeptical_explanations,
+        "contradictions": contradictions,
+        "quote_bank": quote_bank,
+        "unknowns": unknowns,
+        "gaps": gaps,
+    }
 
 
 def _build_cited_sentence(statement: str, source_idx: int, lead_in: str) -> str:
@@ -682,17 +838,153 @@ def _generate_scene_mp3s(
     return audio_bundle
 
 
-def generate_script(dossier: Dict[str, Any] | None, blueprint: Dict[str, Any] | None) -> Dict[str, Any]:
-    if not isinstance(dossier, dict) or not dossier:
-        raise RuntimeError("Run Research first")
-    blueprint_data = blueprint if isinstance(blueprint, dict) else _fallback_build_documentary_blueprint(dossier)
-    result = _fallback_build_documentary_script(blueprint_data, dossier)
-    scenes = result.get("scenes") if isinstance(result.get("scenes"), list) else []
-    text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes if isinstance(scene, dict))
-    word_count_actual = len([token for token in text.split() if token.strip()])
-    result["text"] = text
-    result["word_count_actual"] = word_count_actual
-    result["estimated_minutes"] = round(word_count_actual / 160.0, 2)
+def build_beat_sheet(fact_pack: Dict[str, Any], runtime_minutes: int = 45) -> Dict[str, Any]:
+    contradictions = fact_pack.get("contradictions") if isinstance(fact_pack.get("contradictions"), list) else []
+    strongest = contradictions[0] if contradictions else {
+        "claim_a": "Evidence points one way",
+        "claim_b": "Alternative reading remains plausible",
+    }
+    topic = str(fact_pack.get("topic") or "the case")
+    beats_per_act = max(3, int(runtime_minutes / 6))
+
+    return {
+        "hook": f"A single unresolved event changed how {topic} is remembered.",
+        "stakes": "Public trust, policy decisions, and witness credibility are on the line.",
+        "act_1": [f"Beat {i+1}: establish record and first tension spike." for i in range(beats_per_act)],
+        "act_2": [f"Beat {i+1}: escalate contradiction and pressure test claims." for i in range(beats_per_act)],
+        "midpoint_reversal": f"The strongest contradiction emerges: {strongest.get('claim_a')} versus {strongest.get('claim_b')}.",
+        "act_3": [f"Beat {i+1}: converge sources and test what survives scrutiny." for i in range(beats_per_act)],
+        "final_synthesis": "Only claims supported by corroborated evidence are carried to the conclusion.",
+        "unresolved_questions": [item.get("question") for item in fact_pack.get("unknowns", []) if isinstance(item, dict) and item.get("question")],
+        "emotional_arc": ["Unease", "Curiosity", "Doubt", "Shock", "Clarity", "Measured uncertainty"],
+        "escalation_interval_sec": "60-90",
+        "climax_contradiction": strongest,
+    }
+
+
+def generate_cinematic_script(
+    fact_pack: Dict[str, Any],
+    beat_sheet: Dict[str, Any],
+    runtime_minutes: int = 45,
+    tts_mode: bool = True,
+) -> Dict[str, Any]:
+    target_words = runtime_minutes * WORDS_PER_MINUTE
+    scene_count = 16
+    min_words = int(target_words * 0.85)
+    max_words = int(target_words * 1.15)
+    claims = fact_pack.get("key_claims") if isinstance(fact_pack.get("key_claims"), list) else []
+    timeline = fact_pack.get("timeline_events") if isinstance(fact_pack.get("timeline_events"), list) else []
+    sources = fact_pack.get("sources_used") if isinstance(fact_pack.get("sources_used"), list) else []
+
+    material: list[tuple[str, int]] = []
+    for item in timeline:
+        if isinstance(item, dict):
+            material.append((str(item.get("event") or "").strip(), int(item.get("source_idx") or 1)))
+    for item in claims:
+        if isinstance(item, dict):
+            material.append((str(item.get("claim") or "").strip(), int(item.get("source_idx") or 1)))
+    if not material:
+        material = [("The record remains incomplete and requires careful framing.", 1)]
+
+    titles = [
+        "Cold Open", "First Signal", "The File Opens", "Witness Thread", "Official Lines", "Pressure Builds",
+        "Hidden Friction", "Midpoint Reversal", "Forensic Check", "Competing Story", "Credibility Test", "Climax",
+        "Aftershock", "What Survives", "Unanswered", "Final Synthesis",
+    ]
+
+    scenes: list[Dict[str, Any]] = []
+    cursor = 0
+    words_per_scene = max(360, int(target_words / scene_count))
+    for idx in range(scene_count):
+        lines: list[str] = []
+        used: set[int] = set()
+        while len(" ".join(lines).split()) < words_per_scene:
+            text, source_idx = material[cursor % len(material)]
+            source_idx = source_idx if source_idx > 0 else 1
+            used.add(source_idx)
+            line = f"{text}. According to documented records. [S{source_idx}]"
+            if tts_mode:
+                line = re.sub(r"\s+", " ", line).strip()
+            lines.append(line)
+            if len(lines) % 3 == 0:
+                lines.append("Pause. The pattern sharpens.")
+            cursor += 1
+
+        voiceover = "\n".join(lines)
+        wc = len([w for w in voiceover.split() if w.strip()])
+        scenes.append(
+            {
+                "scene_number": idx + 1,
+                "scene_title": titles[idx],
+                "visual_notes": "Archival images, maps, clean lower-thirds, and timed evidence callouts.",
+                "on_screen_text": [beat_sheet.get("hook" if idx == 0 else "stakes", "")],
+                "voiceover": voiceover,
+                "sources_used": sorted(used),
+                "word_count": wc,
+            }
+        )
+
+    total_words = sum(int(scene.get("word_count") or 0) for scene in scenes)
+    while total_words < min_words:
+        scenes[-1]["voiceover"] += "\nThe final question stays open."
+        scenes[-1]["word_count"] = int(scenes[-1]["word_count"] or 0) + 5
+        total_words += 5
+    if total_words > max_words:
+        trim = total_words - max_words
+        tail_words = scenes[-1]["voiceover"].split()
+        scenes[-1]["voiceover"] = " ".join(tail_words[:-trim]) if trim < len(tail_words) else scenes[-1]["voiceover"]
+        scenes[-1]["word_count"] = len(scenes[-1]["voiceover"].split())
+        total_words = sum(int(scene.get("word_count") or 0) for scene in scenes)
+
+    return {
+        "topic": fact_pack.get("topic"),
+        "scenes": scenes,
+        "scene_count": len(scenes),
+        "target_words": target_words,
+        "word_count": total_words,
+        "word_count_actual": total_words,
+        "estimated_minutes": round(total_words / WORDS_PER_MINUTE, 2),
+        "tts_mode": tts_mode,
+        "source_map": {f"S{int(s.get('idx') or i+1)}": s for i, s in enumerate(sources) if isinstance(s, dict)},
+        "text": "\n\n".join(str(scene.get("voiceover") or "") for scene in scenes),
+        "locked": False,
+        "engine": "cinematic-v3",
+    }
+
+
+def build_timing_map(scenes: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    timing: list[Dict[str, Any]] = []
+    start_sec = 0.0
+    for scene in scenes:
+        scene_number = int(scene.get("scene_number") or len(timing) + 1)
+        duration = float(scene.get("audio_duration_sec") or 0.0)
+        if duration <= 0:
+            duration = round(len(str(scene.get("voiceover") or "").split()) / WORDS_PER_MINUTE * 60.0, 2)
+        end_sec = start_sec + duration
+        timing.append(
+            {
+                "scene_number": scene_number,
+                "start_sec": round(start_sec, 2),
+                "end_sec": round(end_sec, 2),
+                "duration_sec": round(duration, 2),
+                "word_count": len(str(scene.get("voiceover") or "").split()),
+            }
+        )
+        start_sec = end_sec
+    return timing
+
+
+def generate_script(bundle: Dict[str, Any], runtime_minutes: int = 45, tts_mode: bool = True) -> Dict[str, Any]:
+    fact_pack = bundle.get("fact_pack") if isinstance(bundle.get("fact_pack"), dict) else None
+    beat_sheet = bundle.get("beat_sheet") if isinstance(bundle.get("beat_sheet"), dict) else None
+    if not fact_pack:
+        raise RuntimeError("Build Fact Pack first")
+    if not beat_sheet:
+        raise RuntimeError("Build Beat Sheet first")
+    result = generate_cinematic_script(fact_pack, beat_sheet, runtime_minutes=runtime_minutes, tts_mode=tts_mode)
+    bundle["script"] = result
+    bundle["scene_plan"] = _fallback_build_scene_plan(bundle.get("blueprint") or {}, result)
+    bundle["timing"] = build_timing_map(result.get("scenes") or [])
     return result
 
 
@@ -1208,6 +1500,12 @@ if "generated_script_text" not in st.session_state:
     st.session_state["generated_script_text"] = ""
 if "script_editor_text" not in st.session_state:
     st.session_state["script_editor_text"] = ""
+if "last_fact_pack" not in st.session_state:
+    st.session_state["last_fact_pack"] = None
+if "last_beat_sheet" not in st.session_state:
+    st.session_state["last_beat_sheet"] = None
+if "last_timing" not in st.session_state:
+    st.session_state["last_timing"] = None
 
 
 # Atomic submit to prevent rerun races that break Playwright clicks
@@ -1298,8 +1596,11 @@ if run_button:
             _append_bundle_error(run_bundle, "blueprint", exc)
             raise
 
+        run_bundle["fact_pack"] = {}
+        run_bundle["beat_sheet"] = {}
         run_bundle["script"] = {"text": "", "scenes": [], "locked": False}
         run_bundle["scene_plan"] = {"scene_count": 0, "scenes": [], "engine": "pending"}
+        run_bundle["timing"] = []
         run_bundle["images"] = {"images": [], "image_count": 0, "engine": "pending"}
         run_bundle["audio"] = {"scene_mp3s": [], "audio_path": "", "duration_seconds": 0, "engine": "pending"}
 
@@ -1311,7 +1612,10 @@ if run_button:
         st.session_state["script_text"] = ""
         st.session_state["generated_script_text"] = ""
         st.session_state["script_editor_text"] = ""
+        st.session_state["last_fact_pack"] = run_bundle.get("fact_pack")
+        st.session_state["last_beat_sheet"] = run_bundle.get("beat_sheet")
         st.session_state["last_scene_plan"] = run_bundle.get("scene_plan")
+        st.session_state["last_timing"] = run_bundle.get("timing")
         st.session_state["last_images"] = run_bundle.get("images")
         st.session_state["last_audio"] = run_bundle.get("audio")
         st.session_state["last_bundle"] = run_bundle
@@ -1367,8 +1671,11 @@ if dossier:
     bundle = st.session_state.get("last_bundle") or {
         "dossier": dossier,
         "blueprint": blueprint,
+        "fact_pack": st.session_state.get("last_fact_pack") or {},
+        "beat_sheet": st.session_state.get("last_beat_sheet") or {},
         "script": script_result,
         "scene_plan": scene_plan,
+        "timing": st.session_state.get("last_timing") or [],
         "images": image_result,
         "audio": audio_result,
         "video": st.session_state.get("last_video"),
@@ -1388,119 +1695,86 @@ if dossier:
     if "script_editor_text" not in st.session_state:
         st.session_state["script_editor_text"] = st.session_state.get("script_text", "")
 
-    st.subheader("Script")
-    gen_col, save_col, reset_col, regen_col = st.columns(4)
+    st.subheader("Documentary Writer v3")
+    fact_col, beat_col, script_col, save_col, mp3_col = st.columns(5)
 
-    if gen_col.button("Generate Script", use_container_width=True):
-        if not dossier:
-            st.warning("Run Research first")
-        else:
-            script_generated = generate_script(dossier, blueprint)
-            scenes = script_generated.get("scenes") if isinstance(script_generated.get("scenes"), list) else []
-            script_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes if isinstance(scene, dict))
-            script_generated["text"] = script_text
-            script_generated["word_count_actual"] = len([w for w in script_text.split() if w.strip()])
-            script_generated["estimated_minutes"] = round(script_generated["word_count_actual"] / 160.0, 2)
-            script_generated["locked"] = False
-            bundle["script"] = script_generated
-            bundle["scene_plan"] = engine.build_scene_plan(blueprint, script_generated)
+    if fact_col.button("Build Fact Pack", use_container_width=True):
+        bundle["fact_pack"] = build_fact_pack(dossier)
+        st.session_state["last_fact_pack"] = bundle["fact_pack"]
+        st.success("Fact pack built.")
+
+    fact_pack = bundle.get("fact_pack") if isinstance(bundle.get("fact_pack"), dict) else None
+    if fact_pack:
+        st.caption(f"Fact Pack: {len(fact_pack.get('sources_used') or [])} sources, {len(fact_pack.get('timeline_events') or [])} timeline events")
+
+    if beat_col.button("Build Beat Sheet", use_container_width=True, disabled=not bool(fact_pack)):
+        bundle["beat_sheet"] = build_beat_sheet(fact_pack or {}, runtime_minutes=TARGET_DOCUMENTARY_MINUTES)
+        st.session_state["last_beat_sheet"] = bundle["beat_sheet"]
+        st.success("Beat sheet built.")
+
+    beat_sheet = bundle.get("beat_sheet") if isinstance(bundle.get("beat_sheet"), dict) else None
+    can_generate_script = bool(fact_pack and beat_sheet)
+
+    if script_col.button("Generate Script", use_container_width=True, disabled=not can_generate_script):
+        try:
+            script_generated = generate_script(bundle, runtime_minutes=TARGET_DOCUMENTARY_MINUTES, tts_mode=True)
+            script_text = str(script_generated.get("text") or "").strip()
             st.session_state["last_script"] = script_generated
-            st.session_state["last_scene_plan"] = bundle["scene_plan"]
+            st.session_state["last_scene_plan"] = bundle.get("scene_plan")
+            st.session_state["last_timing"] = bundle.get("timing")
             st.session_state["generated_script_text"] = script_text
             st.session_state["script_text"] = script_text
             st.session_state["script_editor_text"] = script_text
-            updated_images, _ = _ensure_fallback_artifacts(primary_topic, bundle["scene_plan"], script_text)
+            updated_images, _ = _ensure_fallback_artifacts(primary_topic, bundle.get("scene_plan") or {}, script_text)
             bundle["images"] = updated_images
             st.session_state["last_images"] = updated_images
             bundle["audio"] = {"scene_mp3s": [], "audio_path": "", "duration_seconds": 0, "engine": "pending"}
             st.session_state["last_audio"] = bundle["audio"]
-            st.success("Generated scene-based documentary script.")
+            st.success("Generated cinematic script.")
+        except Exception as exc:
+            _append_bundle_error(bundle, "script", exc)
+            st.error(str(exc))
 
     if save_col.button("Save Script Changes", use_container_width=True):
         edited_script = str(st.session_state.get("script_editor_text") or "").strip()
-        st.session_state["script_text"] = edited_script
         bundle.setdefault("script", {})["text"] = edited_script
         bundle["script"]["locked"] = True
+        st.session_state["script_text"] = edited_script
         st.success("Script changes saved.")
 
-    if reset_col.button("Reset to Generated Script", use_container_width=True):
-        reset_text = str(st.session_state.get("generated_script_text") or "")
-        st.session_state["script_text"] = reset_text
-        st.session_state["script_editor_text"] = reset_text
-        bundle.setdefault("script", {})["text"] = reset_text
-        bundle["script"]["locked"] = False
-        st.info("Script reset to generated version.")
-
-    if regen_col.button("Regenerate Script (Overwrite)", use_container_width=True, disabled=not bool(bundle.get("script", {}).get("locked"))):
-        script_generated = generate_script(dossier, blueprint)
-        scenes = script_generated.get("scenes") if isinstance(script_generated.get("scenes"), list) else []
-        script_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes if isinstance(scene, dict))
-        script_generated["text"] = script_text
-        script_generated["word_count_actual"] = len([w for w in script_text.split() if w.strip()])
-        script_generated["estimated_minutes"] = round(script_generated["word_count_actual"] / 160.0, 2)
-        script_generated["locked"] = False
-        bundle["script"] = script_generated
-        bundle["scene_plan"] = engine.build_scene_plan(blueprint, script_generated)
-        st.session_state["generated_script_text"] = script_text
-        st.session_state["script_text"] = script_text
-        st.session_state["script_editor_text"] = script_text
-        st.session_state["last_script"] = script_generated
-        st.session_state["last_scene_plan"] = bundle["scene_plan"]
-        st.success("Script regenerated and overwrite complete.")
-
-    st.text_area("Script (editable)", key="script_editor_text", height=400)
-    bundle.setdefault("script", {})["text"] = str(st.session_state.get("script_editor_text") or "").strip()
-
-    st.subheader("Audio")
     scenes_exist = bool(bundle.get("script", {}).get("scenes"))
-    if st.button("Generate MP3s (per scene)", disabled=not scenes_exist, use_container_width=True):
-        try:
-            audio_bundle = _generate_scene_mp3s(bundle, openai_key=openai_key or "")
-            st.session_state["last_audio"] = audio_bundle
-            st.success(f"Generated {len(audio_bundle.get('scene_mp3s') or [])} scene MP3 files.")
-        except Exception as exc:
-            _append_bundle_error(bundle, "scene_tts", exc)
-            st.error(str(exc))
-
-    audio_bundle = bundle.get("audio") if isinstance(bundle.get("audio"), dict) else {}
-    scene_mp3s = audio_bundle.get("scene_mp3s") if isinstance(audio_bundle.get("scene_mp3s"), list) else []
-    st.caption(f"Audio status: {len(scene_mp3s)} scene mp3s")
-    for item in scene_mp3s[:3]:
-        if not isinstance(item, dict):
-            continue
-        audio_path = str(item.get("audio_path") or "")
-        if audio_path and Path(audio_path).exists():
-            st.audio(audio_path)
-
-    if scene_mp3s:
-        st.markdown("**Scene MP3 files**")
-        for item in scene_mp3s:
-            if isinstance(item, dict):
-                st.code(str(item.get("audio_path") or ""))
-
-    st.subheader("Audio (Per-Scene TTS)")
-    if st.button("Generate MP3s (per scene)", use_container_width=True):
+    if mp3_col.button("Generate MP3s (per scene)", use_container_width=True, disabled=not scenes_exist):
         try:
             updated_audio = generate_scene_mp3s(bundle, openai_key=openai_key or "", voice=TTS_VOICE, model=TTS_MODEL, smoke=SMOKE_MODE)
+            bundle["timing"] = build_timing_map(bundle.get("script", {}).get("scenes") or [])
             st.session_state["last_audio"] = updated_audio
+            st.session_state["last_timing"] = bundle.get("timing")
             st.success("Per-scene MP3s generated.")
         except Exception as exc:
             _append_bundle_error(bundle, "audio_tts", exc)
             st.error(str(exc))
 
+    st.text_area("Script (editable)", key="script_editor_text", height=400)
+    bundle.setdefault("script", {})["text"] = str(st.session_state.get("script_editor_text") or "").strip()
+
+    timing_map = bundle.get("timing") if isinstance(bundle.get("timing"), list) else []
+    if timing_map:
+        st.subheader("Timing Map")
+        st.json(timing_map)
+
     current_audio = bundle.get("audio") if isinstance(bundle.get("audio"), dict) else {}
     scene_mp3s = current_audio.get("scene_mp3s") if isinstance(current_audio.get("scene_mp3s"), list) else []
-    for item in scene_mp3s[:3]:
-        path = str(item.get("path") or "").strip() if isinstance(item, dict) else ""
-        if path and Path(path).exists():
-            st.caption(f"Scene {item.get('scene')}: {path}")
-            st.audio(path)
-    if len(scene_mp3s) > 3:
-        st.caption("Additional MP3 files")
-        st.json(scene_mp3s[3:])
+    if scene_mp3s:
+        st.caption(f"Audio status: {len(scene_mp3s)} scene mp3s")
+        for item in scene_mp3s[:3]:
+            path = ""
+            if isinstance(item, dict):
+                path = str(item.get("path") or item.get("audio_path") or "").strip()
+            if path and Path(path).exists():
+                st.audio(path)
 
     if not bundle.get("script", {}).get("scenes"):
-        st.warning("Image generation is disabled until script scenes exist.")
+        st.warning("Script generation is disabled until fact pack and beat sheet exist.")
 
     st.subheader("Video Assembly")
     ffmpeg_check = _ffmpeg_preflight()
