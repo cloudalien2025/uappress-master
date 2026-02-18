@@ -15,7 +15,10 @@
 import json
 import os as _os
 import time
+import tempfile
+import base64
 import inspect
+import wave
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -30,6 +33,103 @@ except Exception:
 
 # Import marker must always exist for Streamlit Cloud import safety.
 ENGINE_IMPORT_MARKER = "TEST_HOOK:ENGINE_IMPORT_FALLBACK"
+_MINIMAL_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAZAAAADICAIAAABJdyC1AAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJ"
+    "bWFnZVJlYWR5ccllPAAAABh0RVh0Q3JlYXRpb24gVGltZQAwMi8xOC8yNvVhXxkAAABBSURBVHja"
+    "7MExAQAAAMKg9U9tCF8gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB4GQAB"
+    "Qf4AAQAAAABJRU5ErkJggg=="
+)
+
+
+def _ensure_fallback_artifacts(
+    topic: str,
+    scene_plan: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    base_dir = (
+        Path(tempfile.gettempdir())
+        / "uappress_artifacts"
+        / str(st.session_state.get("last_run_ts") or int(time.time()))
+    )
+    images_dir = base_dir / "images"
+    audio_dir = base_dir / "audio"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    scenes = scene_plan.get("scenes") if isinstance(scene_plan.get("scenes"), list) else []
+    scene_count = max(1, len(scenes))
+    image_paths: list[str] = []
+
+    for index in range(scene_count):
+        image_path = images_dir / f"scene_{index + 1:02d}.png"
+        try:
+            from PIL import Image, ImageDraw  # type: ignore
+
+            image = Image.new("RGB", (1280, 720), color=(18, 24, 38))
+            draw = ImageDraw.Draw(image)
+            heading = ""
+            if index < len(scenes):
+                heading = str(scenes[index].get("heading") or "")
+            label = f"{topic}\n{heading or f'Scene {index + 1}'}"
+            draw.text((40, 40), label, fill=(235, 242, 255))
+            image.save(image_path)
+        except Exception:
+            image_path.write_bytes(base64.b64decode(_MINIMAL_PNG_BASE64))
+        image_paths.append(str(image_path))
+
+    audio_path = audio_dir / "fallback_narration.wav"
+    with wave.open(str(audio_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16000)
+        wav_file.writeframes(b"\x00\x00" * 16000 * 2)
+
+    return {
+        "scene_images_dir": str(images_dir),
+        "images": image_paths,
+        "image_count": len(image_paths),
+        "engine": "fallback",
+    }, {
+        "audio_path": str(audio_path),
+        "duration_seconds": 2,
+        "engine": "fallback",
+    }
+
+
+def _collect_missing_artifacts(
+    image_result: Dict[str, Any] | None,
+    audio_result: Dict[str, Any] | None,
+) -> list[str]:
+    missing: list[str] = []
+
+    image_paths = []
+    if isinstance(image_result, dict):
+        paths = image_result.get("images")
+        if isinstance(paths, list):
+            image_paths = [str(path) for path in paths if str(path).strip()]
+
+    if not image_paths:
+        missing.append("images list (bundle.images)")
+    else:
+        missing_images = [path for path in image_paths if not Path(path).exists()]
+        if missing_images:
+            missing.append(f"image files not found: {', '.join(missing_images)}")
+
+    audio_path = ""
+    if isinstance(audio_result, dict):
+        audio_path = str(
+            audio_result.get("audio_path")
+            or audio_result.get("audio_mp3_path")
+            or ""
+        ).strip()
+
+    if not audio_path:
+        missing.append(
+            "audio path (bundle.audio.audio_path or bundle.audio.audio_mp3_path)"
+        )
+    elif not Path(audio_path).exists():
+        missing.append(f"audio file not found: {audio_path}")
+
+    return missing
 
 
 def _fallback_score_topic(topic: str, serpapi_key: str | None = None, smoke: bool = False) -> Dict[str, Any]:
@@ -509,7 +609,9 @@ if run_button:
         st.session_state["last_blueprint"] = blueprint
         st.session_state["last_script"] = script_result
         st.session_state["last_scene_plan"] = scene_plan
-        st.session_state["last_audio"] = None
+        image_result, audio_result = _ensure_fallback_artifacts(primary_topic, scene_plan)
+        st.session_state["last_images"] = image_result
+        st.session_state["last_audio"] = audio_result
         st.session_state["run_status"] = "DONE"
 
     except Exception as e:
@@ -569,8 +671,12 @@ if dossier:
     scene_plan = st.session_state.get("last_scene_plan") or {}
 
     if st.button("Assemble Video (MP4)"):
-        if not image_result or not audio_result:
-            st.warning("Images and audio artifacts are required before assembly.")
+        missing_artifacts = _collect_missing_artifacts(image_result, audio_result)
+        if missing_artifacts:
+            st.warning(
+                "Video assembly prerequisites missing: "
+                + " | ".join(missing_artifacts)
+            )
         else:
             try:
                 st.session_state["last_video"] = engine.build_video_asset(
@@ -596,6 +702,9 @@ if dossier:
 
     bundle_payload = {
         "dossier": dossier,
+        "scene_plan": scene_plan,
+        "images": image_result,
+        "audio": audio_result,
         "video": video_result,
     }
     st.download_button(
