@@ -48,6 +48,12 @@ _MINIMAL_PNG_BASE64 = (
     "Qf4AAQAAAABJRU5ErkJggg=="
 )
 
+TARGET_DOCUMENTARY_MINUTES = 45
+WORDS_PER_MINUTE = 160
+TARGET_SCRIPT_WORDS = TARGET_DOCUMENTARY_MINUTES * WORDS_PER_MINUTE
+TTS_MODEL = "gpt-4o-mini-tts"
+TTS_VOICE = "onyx"
+
 
 def _ensure_fallback_artifacts(
     topic: str,
@@ -145,6 +151,61 @@ def _consolidate_script_text(
     return "\n\n".join([part for part in parts if part]).strip()
 
 
+
+
+def generate_script(bundle: Dict[str, Any], *, overwrite: bool = False) -> Dict[str, Any] | None:
+    dossier = bundle.get("dossier") if isinstance(bundle.get("dossier"), dict) else None
+    if not dossier:
+        return None
+    script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
+    if script_bundle.get("locked") and not overwrite:
+        return script_bundle
+    generated = _fallback_build_documentary_script(bundle.get("blueprint") or {}, dossier)
+    bundle["script"] = generated
+    bundle["scene_plan"] = _fallback_build_scene_plan(bundle.get("blueprint") or {}, generated)
+    return generated
+
+
+def generate_scene_mp3s(bundle: Dict[str, Any], *, openai_key: str, voice: str = TTS_VOICE, model: str = TTS_MODEL, smoke: bool = False) -> Dict[str, Any]:
+    if not openai_key:
+        raise ValueError("OpenAI API key missing. Set OPENAI_API_KEY to generate MP3s.")
+
+    script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
+    scenes = script_bundle.get("scenes") if isinstance(script_bundle.get("scenes"), list) else []
+    if not scenes:
+        raise ValueError("Generate Script first")
+
+    from apps.video.tts_engine import generate_vo_audio
+
+    base_dir = Path(tempfile.gettempdir()) / "uappress_artifacts" / str(st.session_state.get("last_run_ts") or int(time.time()))
+    audio_dir = base_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio_bundle = bundle.get("audio") if isinstance(bundle.get("audio"), dict) else {}
+    cache = audio_bundle.get("cache") if isinstance(audio_bundle.get("cache"), dict) else {}
+
+    scene_mp3s = []
+    for idx, scene in enumerate(scenes, start=1):
+        voiceover = str(scene.get("voiceover") or "").strip()
+        sig = hashlib.sha256(f"{voiceover}|{voice}|{model}".encode("utf-8")).hexdigest()
+        target = audio_dir / f"scene_{idx:02d}.mp3"
+        key = f"scene_{idx:02d}"
+        if not (cache.get(key) == sig and target.exists()):
+            result = generate_vo_audio(voiceover, out_dir=str(audio_dir), voice=voice, model=model, openai_key=openai_key, smoke=smoke)
+            src = Path(str(result.get("mp3_path") or ""))
+            if src.exists() and src != target:
+                target.write_bytes(src.read_bytes())
+            cache[key] = sig
+        duration_sec = round(len(voiceover.split()) / WORDS_PER_MINUTE * 60.0, 2)
+        scene["audio_path"] = str(target)
+        scene["audio_duration_sec"] = duration_sec
+        scene_mp3s.append({"scene": idx, "path": str(target), "duration_sec": duration_sec})
+
+    audio_bundle.update({"scene_mp3s": scene_mp3s, "format": "mp3", "voice": voice, "model": model, "cache": cache})
+    bundle["audio"] = audio_bundle
+    bundle["script"]["scenes"] = scenes
+    return audio_bundle
+
+
 def _ffmpeg_preflight() -> Dict[str, Any]:
     ffmpeg_binary = shutil.which("ffmpeg")
     path_value = _os.getenv("PATH", "")
@@ -195,20 +256,18 @@ def _collect_missing_artifacts(
         if missing_images:
             missing.append(f"image files not found: {', '.join(missing_images)}")
 
-    audio_path = ""
+    scene_mp3s = []
     if isinstance(audio_result, dict):
-        audio_path = str(
-            audio_result.get("audio_path")
-            or audio_result.get("audio_mp3_path")
-            or ""
-        ).strip()
+        raw = audio_result.get("scene_mp3s")
+        if isinstance(raw, list):
+            scene_mp3s = [item for item in raw if isinstance(item, dict)]
 
-    if not audio_path:
-        missing.append(
-            "audio path (bundle.audio.audio_path or bundle.audio.audio_mp3_path)"
-        )
-    elif not Path(audio_path).exists():
-        missing.append(f"audio file not found: {audio_path}")
+    if not scene_mp3s:
+        missing.append("scene mp3 list (bundle.audio.scene_mp3s)")
+    else:
+        missing_audio = [str(item.get("path") or "") for item in scene_mp3s if not Path(str(item.get("path") or "")).exists()]
+        if missing_audio:
+            missing.append(f"scene mp3 files not found: {', '.join(missing_audio)}")
 
     return missing
 
@@ -232,7 +291,8 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
 
     script_result = bundle_data.get("script") if isinstance(bundle_data.get("script"), dict) else {}
     script_text = str(script_result.get("text") or "").strip()
-    has_script = bool(script_text)
+    script_scenes = script_result.get("scenes") if isinstance(script_result.get("scenes"), list) else []
+    has_script = bool(script_text) and bool(script_scenes)
 
     image_result = bundle_data.get("images") if isinstance(bundle_data.get("images"), dict) else {}
     image_paths_raw = image_result.get("images") if isinstance(image_result.get("images"), list) else []
@@ -240,23 +300,19 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
     has_images = bool(image_paths) and all(Path(path).exists() for path in image_paths)
 
     audio_result = bundle_data.get("audio") if isinstance(bundle_data.get("audio"), dict) else {}
-    audio_path = str(
-        audio_result.get("audio_path")
-        or audio_result.get("audio_mp3_path")
-        or ""
-    ).strip()
-    has_audio = bool(audio_path) and Path(audio_path).exists()
+    scene_mp3s = audio_result.get("scene_mp3s") if isinstance(audio_result.get("scene_mp3s"), list) else []
+    has_audio = bool(scene_mp3s) and all(Path(str(item.get("path") or "")).exists() for item in scene_mp3s if isinstance(item, dict))
 
     ffmpeg_check = _ffmpeg_preflight()
     has_ffmpeg = bool(ffmpeg_check.get("ok"))
 
     missing_labels: list[str] = []
     if not has_script:
-        missing_labels.append("Script")
-    if not has_images:
-        missing_labels.append("Images")
+        missing_labels.append("Script scenes")
     if not has_audio:
-        missing_labels.append("Audio")
+        missing_labels.append("Scene MP3s")
+    if not has_images:
+        missing_labels.append("Scene images")
     if not has_ffmpeg:
         missing_labels.append("ffmpeg")
 
@@ -347,93 +403,87 @@ def _fallback_build_documentary_script(
 ) -> Dict[str, Any]:
     topic = str(blueprint.get("topic") or "this case").strip() or "this case"
     dossier_data = dossier if isinstance(dossier, dict) else {}
-    summary = str(dossier_data.get("summary") or blueprint.get("summary") or "").strip()
 
     sources = dossier_data.get("sources") if isinstance(dossier_data.get("sources"), list) else []
-    source_citations = []
+    source_refs = []
     for idx, source in enumerate(sources, start=1):
         if not isinstance(source, dict):
             continue
-        title = str(source.get("title") or f"Source {idx}").strip()
-        url = str(source.get("url") or "").strip()
-        citation = f"[{idx}] {title}" if title else f"[{idx}]"
-        if url:
-            citation += f" ({url})"
-        source_citations.append(citation)
-    if not source_citations:
-        source_citations = ["[1] Public records and archived reporting", "[2] Expert commentary"]
+        source_refs.append({
+            "index": idx,
+            "title": str(source.get("title") or f"Source {idx}"),
+            "url": str(source.get("url") or "").strip(),
+        })
+    if not source_refs:
+        source_refs = [{"index": 1, "title": "Source 1", "url": ""}]
 
-    key_points = []
-    for key in ("key_facts", "facts", "claims", "findings", "notes"):
-        values = dossier_data.get(key)
-        if isinstance(values, list):
-            for value in values:
-                text = str(value).strip()
-                if text and text not in key_points:
-                    key_points.append(text)
-    if summary and summary not in key_points:
-        key_points.insert(0, summary)
-    if not key_points:
-        key_points = [
-            f"{topic} has generated sustained public attention across institutions and communities.",
-            "Available evidence is mixed, so conclusions require careful sourcing and clear uncertainty labels.",
-            "A documentary narrative should separate established facts, interpretation, and unresolved questions.",
+    pool: list[str] = []
+    for key in ("summary", "facts", "key_facts", "timeline", "claims", "contradictions", "open_questions", "notes"):
+        value = dossier_data.get(key)
+        if isinstance(value, list):
+            for item in value:
+                text = str(item.get("text") if isinstance(item, dict) else item).strip()
+                if text and text not in pool:
+                    pool.append(text)
+        elif isinstance(value, str):
+            text = value.strip()
+            if text and text not in pool:
+                pool.append(text)
+    if not pool:
+        pool = [
+            "The available dossier entries are limited, so all conclusions in this draft remain provisional.",
+            "Where details are incomplete, this narration labels them as unconfirmed rather than definitive.",
+            "Future updates should replace placeholders with direct quotations and dated records.",
         ]
 
-    scene_templates = [
-        ("Opening Context", "Establish timeline, place, and why the subject matters now."),
-        ("Origins", "Trace the earliest relevant events and actors."),
-        ("What the Records Show", "Present documented evidence and official reporting."),
-        ("How the Story Spread", "Cover media cycles, public interest, and framing changes."),
-        ("Competing Interpretations", "Contrast mainstream and alternative explanations."),
-        ("Data, Gaps, and Method", "Explain what can be measured and what remains uncertain."),
-        ("Human Stakes", "Show impact on institutions, policy, and affected communities."),
-        ("Critical Challenges", "Interrogate weak points, disputed claims, and bias risks."),
-        ("Where Research Stands", "Summarize current consensus and active debates."),
-        ("Conclusion", "Close with balanced takeaways and next evidence to watch."),
-    ]
-
+    scene_count = 14
+    target_words_per_scene = max(320, TARGET_SCRIPT_WORDS // scene_count)
     scenes: list[Dict[str, Any]] = []
-    for idx, (scene_title, intent) in enumerate(scene_templates, start=1):
-        fact_a = key_points[(idx - 1) % len(key_points)]
-        fact_b = key_points[idx % len(key_points)]
-        citation_a = source_citations[(idx - 1) % len(source_citations)]
-        citation_b = source_citations[idx % len(source_citations)]
-        voiceover = (
-            f"In this section, we focus on {topic} through the lens of {scene_title.lower()}. "
-            f"Our objective is to {intent.lower()} We begin with a grounded detail: {fact_a}. "
-            f"That point is useful, but it only tells part of the story, so we layer in a second thread: {fact_b}. "
-            f"Together, these observations reveal how interpretation can drift when context is missing. "
-            f"To keep the narrative evidence-led, we tag supporting material as {citation_a} and {citation_b}, "
-            "while noting that source quality and access can limit certainty. "
-            "As viewers, we should separate what is directly documented from what is inferred, and treat dramatic claims with proportionate scrutiny. "
-            "That discipline helps us move from speculation toward a reliable documentary account."
-        )
+
+    for idx in range(scene_count):
+        scene_number = idx + 1
+        focus = [pool[(idx + o) % len(pool)] for o in range(4)]
+        citation_indices = sorted({((idx + o) % len(source_refs)) + 1 for o in range(3)})
+        source_cues = [source_refs[c - 1].get("url") or f"Source #{c}" for c in citation_indices]
+
+        paragraphs: list[str] = []
+        while len(" ".join(paragraphs).split()) < target_words_per_scene:
+            cidx = citation_indices[len(paragraphs) % len(citation_indices)]
+            point = focus[len(paragraphs) % len(focus)]
+            paragraphs.append(
+                f"For this chapter on {topic}, we anchor every claim to the dossier and identified records. "
+                f"The current evidence emphasizes: {point}. (Source {cidx}) "
+                "If a detail cannot be independently verified, we label it as unconfirmed and avoid escalating language."
+            )
+            paragraphs.append(
+                f"We then compare that entry against other claims, timeline notes, and contradictions in the same dossier. "
+                f"When records disagree, we preserve the disagreement instead of forcing certainty, and we keep the burden of proof visible. (Source {cidx})"
+            )
+
+        voiceover = "\n\n".join(paragraphs).strip()
         scenes.append(
             {
-                "scene_number": idx,
-                "scene_title": scene_title,
-                "visual_notes": (
-                    f"Cinematic b-roll and graphics for {scene_title.lower()}: maps, timelines, archival clips, "
-                    f"and overlays highlighting: {fact_a}"
-                ),
-                "on_screen_text": [
-                    f"Scene {idx}: {scene_title}",
-                    f"Evidence tags: {citation_a}",
-                ],
+                "scene_number": scene_number,
+                "scene_title": f"{topic} — Scene {scene_number}",
+                "visual_notes": "Archival pages, timeline graphics, map context, and labeled evidence overlays.",
+                "on_screen_text": [f"Scene {scene_number}", "Dossier-grounded narrative"],
                 "voiceover": voiceover,
+                "source_cues": source_cues,
             }
         )
 
-    narration_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in scenes if scene.get("voiceover"))
+    narration_text = "\n\n".join(str(scene.get("voiceover") or "") for scene in scenes).strip()
     word_count = len([token for token in narration_text.split() if token.strip()])
-
     return {
         "topic": topic,
         "scenes": scenes,
         "text": narration_text,
-        "word_count": word_count,
+        "target_minutes": TARGET_DOCUMENTARY_MINUTES,
+        "target_words": TARGET_SCRIPT_WORDS,
+        "word_count_actual": word_count,
+        "based_on_sources": source_refs,
         "scene_count": len(scenes),
+        "locked": False,
         "engine": "fallback",
     }
 
@@ -482,13 +532,10 @@ def _fallback_build_video_asset(
         if isinstance(candidate_paths, list):
             image_paths = [str(path).strip() for path in candidate_paths if str(path).strip()]
 
-    audio_path = ""
+    audio_paths: list[str] = []
     if isinstance(audio_result, dict):
-        audio_path = str(
-            audio_result.get("audio_path")
-            or audio_result.get("audio_mp3_path")
-            or ""
-        ).strip()
+        scene_mp3s = audio_result.get("scene_mp3s") if isinstance(audio_result.get("scene_mp3s"), list) else []
+        audio_paths = [str(item.get("path") or "").strip() for item in scene_mp3s if isinstance(item, dict) and str(item.get("path") or "").strip()]
 
     missing_artifacts = _collect_missing_artifacts(image_result, audio_result)
     preflight_errors: list[str] = []
@@ -519,7 +566,8 @@ def _fallback_build_video_asset(
         }
         return video_result
 
-    base_video_dir = Path(audio_path).resolve().parent.parent / "video"
+    first_audio = Path(audio_paths[0]).resolve()
+    base_video_dir = first_audio.parent.parent / "video"
     base_video_dir.mkdir(parents=True, exist_ok=True)
     mp4_path = base_video_dir / "fallback_assembly.mp4"
     concat_file = base_video_dir / "fallback_images.txt"
@@ -540,6 +588,14 @@ def _fallback_build_video_asset(
     concat_lines.append(f"file '{Path(image_paths[-1]).resolve().as_posix()}'")
     concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
 
+    audio_concat = base_video_dir / "fallback_audio.txt"
+    merged_audio_path = base_video_dir / "merged_audio.mp3"
+    audio_concat.write_text("\n".join([f"file '{Path(p).resolve().as_posix()}'" for p in audio_paths]) + "\n", encoding="utf-8")
+    audio_merge_cmd = [str(ffmpeg_binary), "-y", "-f", "concat", "-safe", "0", "-i", str(audio_concat), "-c", "copy", str(merged_audio_path)]
+    audio_merge_run = subprocess.run(audio_merge_cmd, capture_output=True, text=True, check=False)
+    if audio_merge_run.returncode != 0:
+        raise RuntimeError(audio_merge_run.stderr.strip() or "ffmpeg failed merging scene mp3 files")
+
     ffmpeg_cmd = [
         str(ffmpeg_binary),
         "-y",
@@ -550,7 +606,7 @@ def _fallback_build_video_asset(
         "-i",
         str(concat_file),
         "-i",
-        audio_path,
+        str(merged_audio_path),
         "-c:v",
         "libx264",
         "-pix_fmt",
@@ -1170,6 +1226,41 @@ if dossier:
     bundle["script"] = script_bundle
 
     st.subheader("Script")
+    gen_col, overwrite_col = st.columns(2)
+    if gen_col.button("Generate Script", use_container_width=True):
+        generated = generate_script(bundle, overwrite=False)
+        if generated is None:
+            st.warning("Run Research first")
+        elif bool(bundle.get("script", {}).get("locked")):
+            st.warning("Script is locked. Use Overwrite Generated Script to regenerate.")
+        else:
+            generated_text = str(generated.get("text") or "")
+            st.session_state["last_script"] = generated
+            st.session_state["script_text"] = generated_text
+            st.session_state["generated_script_text"] = generated_text
+            st.session_state["script_editor_text"] = generated_text
+            st.session_state["last_scene_plan"] = bundle.get("scene_plan")
+            st.success("Script generated from dossier.")
+
+    if overwrite_col.button("Overwrite Generated Script", use_container_width=True):
+        generated = generate_script(bundle, overwrite=True)
+        if generated is None:
+            st.warning("Run Research first")
+        else:
+            generated_text = str(generated.get("text") or "")
+            st.session_state["last_script"] = generated
+            st.session_state["script_text"] = generated_text
+            st.session_state["generated_script_text"] = generated_text
+            st.session_state["script_editor_text"] = generated_text
+            st.session_state["last_scene_plan"] = bundle.get("scene_plan")
+            st.success("Script overwritten and regenerated.")
+
+    script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
+    if script_bundle.get("text"):
+        word_count_actual = int(script_bundle.get("word_count_actual") or len(str(script_bundle.get("text") or "").split()))
+        runtime_min = round(word_count_actual / WORDS_PER_MINUTE, 1)
+        st.caption(f"Word count: {word_count_actual} | Estimated runtime: {runtime_min} min")
+
     st.text_area("Script (editable)", key="script_editor_text", height=400)
 
     script_save_col, script_reset_col = st.columns(2)
@@ -1177,17 +1268,9 @@ if dossier:
         edited_script = str(st.session_state.get("script_editor_text") or "").strip()
         st.session_state["script_text"] = edited_script
         bundle["script"]["text"] = edited_script
+        bundle["script"]["word_count_actual"] = len(edited_script.split())
         bundle["script"]["locked"] = True
-        try:
-            updated_images, updated_audio = _ensure_fallback_artifacts(primary_topic, scene_plan, edited_script)
-            st.session_state["last_images"] = updated_images
-            st.session_state["last_audio"] = updated_audio
-            bundle["images"] = updated_images
-            bundle["audio"] = updated_audio
-            st.success("Script changes saved. Audio regenerated from edited script.")
-        except Exception as exc:
-            _append_bundle_error(bundle, "script_save_audio_regeneration", exc)
-            st.error(f"Script saved, but audio regeneration failed: {exc}")
+        st.success("Script changes saved. Script locked.")
 
     if script_reset_col.button("Reset to Generated Script", use_container_width=True):
         reset_text = str(st.session_state.get("generated_script_text") or generated_script_text)
@@ -1199,6 +1282,30 @@ if dossier:
 
     bundle["script"]["text"] = str(st.session_state.get("script_text") or "").strip()
     bundle["script"]["locked"] = bool(bundle["script"].get("locked"))
+
+    st.subheader("Audio (Per-Scene TTS)")
+    if st.button("Generate MP3s (per scene)", use_container_width=True):
+        try:
+            updated_audio = generate_scene_mp3s(bundle, openai_key=openai_key or "", voice=TTS_VOICE, model=TTS_MODEL, smoke=SMOKE_MODE)
+            st.session_state["last_audio"] = updated_audio
+            st.success("Per-scene MP3s generated.")
+        except Exception as exc:
+            _append_bundle_error(bundle, "audio_tts", exc)
+            st.error(str(exc))
+
+    current_audio = bundle.get("audio") if isinstance(bundle.get("audio"), dict) else {}
+    scene_mp3s = current_audio.get("scene_mp3s") if isinstance(current_audio.get("scene_mp3s"), list) else []
+    for item in scene_mp3s[:3]:
+        path = str(item.get("path") or "").strip() if isinstance(item, dict) else ""
+        if path and Path(path).exists():
+            st.caption(f"Scene {item.get('scene')}: {path}")
+            st.audio(path)
+    if len(scene_mp3s) > 3:
+        st.caption("Additional MP3 files")
+        st.json(scene_mp3s[3:])
+
+    if not bundle.get("script", {}).get("scenes"):
+        st.warning("Image generation is disabled until script scenes exist.")
 
     st.subheader("Video Assembly")
     ffmpeg_check = _ffmpeg_preflight()
