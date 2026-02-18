@@ -1448,7 +1448,7 @@ topic_idea = st.text_input(
     key="topic_idea_input",
 )
 
-if st.button("Score Topic", key="score_topic_button"):
+if st.button("Score Topic", key="btn_topic_score"):
     if not topic_idea.strip():
         st.warning("Please enter a topic idea to score.")
     else:
@@ -1472,7 +1472,7 @@ if topic_score:
     getattr(st, badge_type)(f"Recommendation: {recommendation}")
     st.json(topic_score)
 
-if st.button("Use as Primary Topic", key="use_as_primary_topic_button"):
+if st.button("Use as Primary Topic", key="btn_topic_use_as_primary"):
     if topic_idea.strip():
         st.session_state["primary_topic_input"] = topic_idea
         st.success("Primary Topic updated from Topic Idea.")
@@ -1519,6 +1519,7 @@ with st.form("research_form", clear_on_submit=False):
     run_button = st.form_submit_button(
         "Run Research",
         use_container_width=True,
+        key="submit_research_run",
     )
 
 
@@ -1698,7 +1699,7 @@ if dossier:
     st.subheader("Documentary Writer v3")
     fact_col, beat_col, script_col, save_col, mp3_col = st.columns(5)
 
-    if fact_col.button("Build Fact Pack", use_container_width=True):
+    if fact_col.button("Build Fact Pack", use_container_width=True, key="btn_topic_build_fact_pack"):
         bundle["fact_pack"] = build_fact_pack(dossier)
         st.session_state["last_fact_pack"] = bundle["fact_pack"]
         st.success("Fact pack built.")
@@ -1707,7 +1708,12 @@ if dossier:
     if fact_pack:
         st.caption(f"Fact Pack: {len(fact_pack.get('sources_used') or [])} sources, {len(fact_pack.get('timeline_events') or [])} timeline events")
 
-    if beat_col.button("Build Beat Sheet", use_container_width=True, disabled=not bool(fact_pack)):
+    if beat_col.button(
+        "Build Beat Sheet",
+        use_container_width=True,
+        disabled=not bool(fact_pack),
+        key="btn_topic_build_beat_sheet",
+    ):
         bundle["beat_sheet"] = build_beat_sheet(fact_pack or {}, runtime_minutes=TARGET_DOCUMENTARY_MINUTES)
         st.session_state["last_beat_sheet"] = bundle["beat_sheet"]
         st.success("Beat sheet built.")
@@ -1715,7 +1721,12 @@ if dossier:
     beat_sheet = bundle.get("beat_sheet") if isinstance(bundle.get("beat_sheet"), dict) else None
     can_generate_script = bool(fact_pack and beat_sheet)
 
-    if script_col.button("Generate Script", use_container_width=True, disabled=not can_generate_script):
+    if script_col.button(
+        "Generate Script",
+        use_container_width=True,
+        disabled=not can_generate_script,
+        key="btn_topic_generate_script",
+    ):
         try:
             script_generated = generate_script(bundle, runtime_minutes=TARGET_DOCUMENTARY_MINUTES, tts_mode=True)
             script_text = str(script_generated.get("text") or "").strip()
@@ -1735,7 +1746,7 @@ if dossier:
             _append_bundle_error(bundle, "script", exc)
             st.error(str(exc))
 
-    if save_col.button("Save Script Changes", use_container_width=True):
+    if save_col.button("Save Script Changes", use_container_width=True, key="btn_topic_save_script_changes"):
         edited_script = str(st.session_state.get("script_editor_text") or "").strip()
         bundle.setdefault("script", {})["text"] = edited_script
         bundle["script"]["locked"] = True
@@ -1743,7 +1754,12 @@ if dossier:
         st.success("Script changes saved.")
 
     scenes_exist = bool(bundle.get("script", {}).get("scenes"))
-    if mp3_col.button("Generate MP3s (per scene)", use_container_width=True, disabled=not scenes_exist):
+    if mp3_col.button(
+        "Generate MP3s (per scene)",
+        use_container_width=True,
+        disabled=not scenes_exist,
+        key="btn_audio_generate_mp3s_per_scene",
+    ):
         try:
             updated_audio = generate_scene_mp3s(bundle, openai_key=openai_key or "", voice=TTS_VOICE, model=TTS_MODEL, smoke=SMOKE_MODE)
             bundle["timing"] = build_timing_map(bundle.get("script", {}).get("scenes") or [])
@@ -1796,7 +1812,11 @@ if dossier:
     image_result = st.session_state.get("last_images")
     audio_result = st.session_state.get("last_audio")
 
-    if st.button("Assemble Video (MP4)", disabled=not readiness.get("ready_for_video", False)):
+    if st.button(
+        "Assemble Video (MP4)",
+        disabled=not readiness.get("ready_for_video", False),
+        key="btn_video_assemble_mp4",
+    ):
         try:
             st.session_state["last_video"] = engine.build_video_asset(
                 image_result=image_result,
