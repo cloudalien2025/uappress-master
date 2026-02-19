@@ -484,12 +484,100 @@ def _source_domain(url: str) -> str:
     return (match.group(1).lower() if match else (url or "").lower()).replace("www.", "")
 
 
+def _extract_timeline_candidates(dossier: Dict[str, Any], sources: list[Dict[str, Any]]) -> list[str]:
+    timeline_markers = re.compile(
+        r"(\b(?:19|20)\d{2}\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b|"
+        r"\b\d{1,2}:\d{2}\s?(?:am|pm)?\b|\bfirst\b|\bthen\b|\bnext\b|\blater\b|\bafter\b|"
+        r"\bbefore\b|\bfinally\b|\bearlier\b|\bsubsequently\b)",
+        re.IGNORECASE,
+    )
+    candidates: list[str] = []
+    fields_to_scan = [
+        dossier.get("timeline"),
+        dossier.get("chronology"),
+        dossier.get("summary"),
+        dossier.get("findings"),
+        dossier.get("claims"),
+        dossier.get("facts"),
+        dossier.get("notes"),
+    ]
+    for raw in fields_to_scan:
+        for item in _normalize_dossier_items(raw):
+            if timeline_markers.search(item) and item not in candidates:
+                candidates.append(item)
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        snippets = [
+            str(source.get("title") or "").strip(),
+            str(source.get("snippet") or "").strip(),
+            str(source.get("summary") or "").strip(),
+            str(source.get("published_at") or source.get("date") or "").strip(),
+        ]
+        for snippet in snippets:
+            if snippet and timeline_markers.search(snippet) and snippet not in candidates:
+                candidates.append(snippet)
+    return candidates
+
+
+def _build_narrative_spine(
+    official_positions: list[Dict[str, Any]],
+    witness_accounts: list[Dict[str, Any]],
+    contradictions: list[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    spine: list[Dict[str, Any]] = []
+
+    for item in official_positions[:3]:
+        statement = str(item.get("statement") or "").strip()
+        if statement:
+            spine.append(
+                {
+                    "beat": statement,
+                    "kind": "official_statement",
+                    "source_idx": int(item.get("source_idx") or 1),
+                }
+            )
+
+    for item in witness_accounts[:3]:
+        summary = str(item.get("summary") or "").strip()
+        if summary:
+            spine.append(
+                {
+                    "beat": summary,
+                    "kind": "witness_account",
+                    "source_idx": int(item.get("source_idx") or 1),
+                }
+            )
+
+    for item in contradictions[:3]:
+        claim_a = str(item.get("claim_a") or "").strip()
+        claim_b = str(item.get("claim_b") or "").strip()
+        if claim_a or claim_b:
+            spine.append(
+                {
+                    "beat": f"Contradiction: {claim_a} vs {claim_b}".strip(),
+                    "kind": "contradiction",
+                    "source_idx": int((item.get("source_indices") or [1])[0] or 1),
+                }
+            )
+
+    deduped: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in spine:
+        beat = str(item.get("beat") or "").strip()
+        if beat and beat.lower() not in seen:
+            deduped.append(item)
+            seen.add(beat.lower())
+    return deduped
+
+
 def build_fact_pack(dossier: Dict[str, Any]) -> Dict[str, Any]:
     topic = str(dossier.get("topic") or dossier.get("primary_topic") or "Untitled Topic").strip()
     raw_sources = dossier.get("sources") if isinstance(dossier.get("sources"), list) else []
     unique_domains: set[str] = set()
     sources_used: list[Dict[str, Any]] = []
-    gaps: list[str] = []
+    gaps: Dict[str, Any] = {"items": []}
 
     for source in raw_sources:
         if not isinstance(source, dict):
@@ -509,6 +597,14 @@ def build_fact_pack(dossier: Dict[str, Any]) -> Dict[str, Any]:
         return _pick_source_for_item(text, len(sources_used), 0)
 
     timeline_items = _normalize_dossier_items(dossier.get("timeline") or dossier.get("chronology"))
+    extracted_candidates = _extract_timeline_candidates(dossier, raw_sources)
+    if len(timeline_items) < 5:
+        for candidate in extracted_candidates:
+            if candidate not in timeline_items:
+                timeline_items.append(candidate)
+            if len(timeline_items) >= 5:
+                break
+
     timeline_events = [
         {
             "date": "Unknown",
@@ -560,7 +656,7 @@ def build_fact_pack(dossier: Dict[str, Any]) -> Dict[str, Any]:
 
     contradiction_items = _normalize_dossier_items(dossier.get("contradictions") or dossier.get("conflicts"))
     contradictions = []
-    for idx, item in enumerate(contradiction_items):
+    for item in contradiction_items:
         claims = [part.strip() for part in re.split(r"\bbut\b|\bhowever\b|\bvs\.?\b", item, flags=re.IGNORECASE) if part.strip()]
         claim_a = claims[0] if claims else item
         claim_b = claims[1] if len(claims) > 1 else "Counterclaim remains unresolved"
@@ -582,17 +678,23 @@ def build_fact_pack(dossier: Dict[str, Any]) -> Dict[str, Any]:
         for item in _normalize_dossier_items(dossier.get("unknowns") or dossier.get("open_questions"))[:8]
     ]
 
-    if not sources_used:
-        gaps.append("No usable sources extracted from dossier.sources")
+    spine: list[Dict[str, Any]] = []
     if not timeline_events:
-        gaps.append("No timeline events extracted")
+        gaps["timeline_reason"] = "Timeline extraction failed from dossier timeline/chronology and source snippets."
+        spine = _build_narrative_spine(official_positions, witness_accounts, contradictions)
+
+    if not sources_used:
+        gaps["items"].append("No usable sources extracted from dossier.sources")
+    if not timeline_events:
+        gaps["items"].append("No timeline events extracted")
     if not key_claims:
-        gaps.append("No key claims extracted")
+        gaps["items"].append("No key claims extracted")
 
     return {
         "topic": topic,
         "sources_used": sources_used,
         "timeline_events": timeline_events,
+        "spine": spine,
         "key_claims": key_claims,
         "witness_accounts": witness_accounts,
         "official_positions": official_positions,
@@ -862,6 +964,14 @@ def build_beat_sheet(fact_pack: Dict[str, Any], runtime_minutes: int = 45) -> Di
     }
 
 
+def _scene_similarity_key(text: str) -> tuple[str, str]:
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    if not normalized:
+        return "", ""
+    first_sentence = re.split(r"(?<=[.!?])\s+", normalized)[0]
+    return first_sentence[:180], normalized[:700]
+
+
 def generate_cinematic_script(
     fact_pack: Dict[str, Any],
     beat_sheet: Dict[str, Any],
@@ -872,64 +982,143 @@ def generate_cinematic_script(
     scene_count = 16
     min_words = int(target_words * 0.85)
     max_words = int(target_words * 1.15)
-    claims = fact_pack.get("key_claims") if isinstance(fact_pack.get("key_claims"), list) else []
+
     timeline = fact_pack.get("timeline_events") if isinstance(fact_pack.get("timeline_events"), list) else []
+    claims = fact_pack.get("key_claims") if isinstance(fact_pack.get("key_claims"), list) else []
+    spine = fact_pack.get("spine") if isinstance(fact_pack.get("spine"), list) else []
     sources = fact_pack.get("sources_used") if isinstance(fact_pack.get("sources_used"), list) else []
 
-    material: list[tuple[str, int]] = []
+    evidence_pool: list[Dict[str, Any]] = []
     for item in timeline:
-        if isinstance(item, dict):
-            material.append((str(item.get("event") or "").strip(), int(item.get("source_idx") or 1)))
+        if isinstance(item, dict) and str(item.get("event") or "").strip():
+            evidence_pool.append(
+                {
+                    "text": str(item.get("event") or "").strip(),
+                    "source_idx": int(item.get("source_idx") or 1),
+                    "kind": "timeline",
+                }
+            )
     for item in claims:
-        if isinstance(item, dict):
-            material.append((str(item.get("claim") or "").strip(), int(item.get("source_idx") or 1)))
-    if not material:
-        material = [("The record remains incomplete and requires careful framing.", 1)]
+        if isinstance(item, dict) and str(item.get("claim") or "").strip():
+            evidence_pool.append(
+                {
+                    "text": str(item.get("claim") or "").strip(),
+                    "source_idx": int(item.get("source_idx") or 1),
+                    "kind": "claim",
+                }
+            )
+    for item in spine:
+        if isinstance(item, dict) and str(item.get("beat") or "").strip():
+            evidence_pool.append(
+                {
+                    "text": str(item.get("beat") or "").strip(),
+                    "source_idx": int(item.get("source_idx") or 1),
+                    "kind": str(item.get("kind") or "spine"),
+                }
+            )
+
+    if not evidence_pool:
+        evidence_pool = [{"text": "No corroborated narrative beat available.", "source_idx": 1, "kind": "gap"}]
 
     titles = [
         "Cold Open", "First Signal", "The File Opens", "Witness Thread", "Official Lines", "Pressure Builds",
         "Hidden Friction", "Midpoint Reversal", "Forensic Check", "Competing Story", "Credibility Test", "Climax",
         "Aftershock", "What Survives", "Unanswered", "Final Synthesis",
     ]
+    scene_goals = [
+        "Frame the central mystery.", "Introduce first verified marker.", "Lay out chronology anchors.",
+        "Contrast witness memory against records.", "Test official statements.", "Raise evidentiary pressure.",
+        "Reveal hidden inconsistency.", "Flip the expected interpretation.", "Stress-test physical evidence.",
+        "Show competing narratives.", "Score source credibility.", "Present highest-stakes contradiction.",
+        "Track consequences of uncertainty.", "Retain only corroborated facts.", "List unresolved questions.",
+        "Deliver measured synthesis.",
+    ]
+    tension_shifts = [
+        "Curiosity to concern", "Concern to urgency", "Urgency to doubt", "Doubt to empathy", "Empathy to skepticism",
+        "Skepticism to pressure", "Pressure to fracture", "Fracture to reversal", "Reversal to scrutiny", "Scrutiny to conflict",
+        "Conflict to evaluation", "Evaluation to climax", "Climax to fallout", "Fallout to filtering", "Filtering to ambiguity",
+        "Ambiguity to restrained clarity",
+    ]
 
     scenes: list[Dict[str, Any]] = []
-    cursor = 0
-    words_per_scene = max(360, int(target_words / scene_count))
-    for idx in range(scene_count):
-        lines: list[str] = []
-        used: set[int] = set()
-        while len(" ".join(lines).split()) < words_per_scene:
-            text, source_idx = material[cursor % len(material)]
-            source_idx = source_idx if source_idx > 0 else 1
-            used.add(source_idx)
-            line = f"{text}. According to documented records. [S{source_idx}]"
-            if tts_mode:
-                line = re.sub(r"\s+", " ", line).strip()
-            lines.append(line)
-            if len(lines) % 3 == 0:
-                lines.append("Pause. The pattern sharpens.")
-            cursor += 1
+    similarity_keys: set[tuple[str, str]] = set()
+    evidence_cursor = 0
+    words_per_scene = max(220, int(target_words / scene_count))
 
-        voiceover = "\n".join(lines)
-        wc = len([w for w in voiceover.split() if w.strip()])
-        scenes.append(
-            {
-                "scene_number": idx + 1,
-                "scene_title": titles[idx],
-                "visual_notes": "Archival images, maps, clean lower-thirds, and timed evidence callouts.",
-                "on_screen_text": [beat_sheet.get("hook" if idx == 0 else "stakes", "")],
-                "voiceover": voiceover,
-                "sources_used": sorted(used),
-                "word_count": wc,
-            }
-        )
+    for idx in range(scene_count):
+        scene_number = idx + 1
+        attempts = 0
+        while attempts < 3:
+            attempts += 1
+            scene_evidence: list[Dict[str, Any]] = []
+            start_offset = evidence_cursor + (attempts - 1)
+            for shift in range(3):
+                pick = evidence_pool[(start_offset + shift) % len(evidence_pool)]
+                scene_evidence.append(pick)
+            evidence_cursor += 2
+
+            unique_sources = []
+            for evidence in scene_evidence:
+                src = int(evidence.get("source_idx") or 1)
+                if src not in unique_sources:
+                    unique_sources.append(src)
+            if len(unique_sources) < 2 and len(sources) >= 2:
+                for source in sources:
+                    src = int(source.get("idx") or 1)
+                    if src not in unique_sources:
+                        unique_sources.append(src)
+                    if len(unique_sources) >= 2:
+                        break
+
+            goal = scene_goals[idx % len(scene_goals)]
+            if attempts > 1:
+                goal = f"Reframe: {goal}"
+
+            lead = [
+                f"Scene {scene_number} establishes the beat: {goal}",
+                f"Tension shift: {tension_shifts[idx % len(tension_shifts)]}.",
+            ]
+            body: list[str] = []
+            while len(" ".join(lead + body).split()) < words_per_scene:
+                for evidence in scene_evidence:
+                    source_idx = int(evidence.get("source_idx") or 1)
+                    text = str(evidence.get("text") or "").strip().rstrip(".")
+                    body.append(f"{text}. [S{source_idx}]")
+                body.append(
+                    f"This scene advances from {tension_shifts[idx % len(tension_shifts)]} by cross-checking the same beat against independent records."
+                )
+
+            voiceover = "\n".join(lead + body)
+            if tts_mode:
+                voiceover = re.sub(r"\s+", " ", voiceover).strip()
+
+            sim_key = _scene_similarity_key(voiceover)
+            if sim_key in similarity_keys:
+                continue
+            similarity_keys.add(sim_key)
+
+            scenes.append(
+                {
+                    "scene_number": scene_number,
+                    "scene_title": titles[idx % len(titles)],
+                    "scene_goal": goal,
+                    "tension_shift": tension_shifts[idx % len(tension_shifts)],
+                    "evidence_ids": [f"S{src}" for src in unique_sources[:3]],
+                    "visual_notes": "Archival images, maps, clean lower-thirds, and timed evidence callouts.",
+                    "on_screen_text": [beat_sheet.get("hook" if idx == 0 else "stakes", "")],
+                    "voiceover": voiceover,
+                    "sources_used": unique_sources[:3],
+                    "word_count": len(voiceover.split()),
+                }
+            )
+            break
 
     total_words = sum(int(scene.get("word_count") or 0) for scene in scenes)
-    while total_words < min_words:
-        scenes[-1]["voiceover"] += "\nThe final question stays open."
+    while total_words < min_words and scenes:
+        scenes[-1]["voiceover"] += " The final question stays open."
         scenes[-1]["word_count"] = int(scenes[-1]["word_count"] or 0) + 5
         total_words += 5
-    if total_words > max_words:
+    if total_words > max_words and scenes:
         trim = total_words - max_words
         tail_words = scenes[-1]["voiceover"].split()
         scenes[-1]["voiceover"] = " ".join(tail_words[:-trim]) if trim < len(tail_words) else scenes[-1]["voiceover"]
@@ -946,9 +1135,12 @@ def generate_cinematic_script(
         "estimated_minutes": round(total_words / WORDS_PER_MINUTE, 2),
         "tts_mode": tts_mode,
         "source_map": {f"S{int(s.get('idx') or i+1)}": s for i, s in enumerate(sources) if isinstance(s, dict)},
-        "text": "\n\n".join(str(scene.get("voiceover") or "") for scene in scenes),
+        "text": "\n\n".join(
+            f"--- Scene {int(scene.get('scene_number') or 0)}: {scene.get('scene_title') or ''} ---\n{str(scene.get('voiceover') or '').strip()}"
+            for scene in scenes
+        ),
         "locked": False,
-        "engine": "cinematic-v3",
+        "engine": "cinematic-v4",
     }
 
 
@@ -981,6 +1173,10 @@ def generate_script(bundle: Dict[str, Any], runtime_minutes: int = 45, tts_mode:
         raise RuntimeError("Build Fact Pack first")
     if not beat_sheet:
         raise RuntimeError("Build Beat Sheet first")
+    timeline_events = fact_pack.get("timeline_events") if isinstance(fact_pack.get("timeline_events"), list) else []
+    spine = fact_pack.get("spine") if isinstance(fact_pack.get("spine"), list) else []
+    if len(timeline_events) == 0 and len(spine) == 0:
+        raise RuntimeError("Cannot generate cinematic script: no timeline_events or narrative spine. Rebuild Fact Pack.")
     result = generate_cinematic_script(fact_pack, beat_sheet, runtime_minutes=runtime_minutes, tts_mode=tts_mode)
     bundle["script"] = result
     bundle["scene_plan"] = _fallback_build_scene_plan(bundle.get("blueprint") or {}, result)
@@ -1727,24 +1923,29 @@ if dossier:
         disabled=not can_generate_script,
         key="btn_topic_generate_script",
     ):
-        try:
-            script_generated = generate_script(bundle, runtime_minutes=TARGET_DOCUMENTARY_MINUTES, tts_mode=True)
-            script_text = str(script_generated.get("text") or "").strip()
-            st.session_state["last_script"] = script_generated
-            st.session_state["last_scene_plan"] = bundle.get("scene_plan")
-            st.session_state["last_timing"] = bundle.get("timing")
-            st.session_state["generated_script_text"] = script_text
-            st.session_state["script_text"] = script_text
-            st.session_state["script_editor_text"] = script_text
-            updated_images, _ = _ensure_fallback_artifacts(primary_topic, bundle.get("scene_plan") or {}, script_text)
-            bundle["images"] = updated_images
-            st.session_state["last_images"] = updated_images
-            bundle["audio"] = {"scene_mp3s": [], "audio_path": "", "duration_seconds": 0, "engine": "pending"}
-            st.session_state["last_audio"] = bundle["audio"]
-            st.success("Generated cinematic script.")
-        except Exception as exc:
-            _append_bundle_error(bundle, "script", exc)
-            st.error(str(exc))
+        timeline_events = fact_pack.get("timeline_events") if isinstance((fact_pack or {}).get("timeline_events"), list) else []
+        spine = fact_pack.get("spine") if isinstance((fact_pack or {}).get("spine"), list) else []
+        if len(timeline_events) == 0 and len(spine) == 0:
+            st.error("Cannot generate cinematic script: no timeline_events or narrative spine. Rebuild Fact Pack.")
+        else:
+            try:
+                script_generated = generate_script(bundle, runtime_minutes=TARGET_DOCUMENTARY_MINUTES, tts_mode=True)
+                script_text = str(script_generated.get("text") or "").strip()
+                st.session_state["last_script"] = script_generated
+                st.session_state["last_scene_plan"] = bundle.get("scene_plan")
+                st.session_state["last_timing"] = bundle.get("timing")
+                st.session_state["generated_script_text"] = script_text
+                st.session_state["script_text"] = script_text
+                st.session_state["script_editor_text"] = script_text
+                updated_images, _ = _ensure_fallback_artifacts(primary_topic, bundle.get("scene_plan") or {}, script_text)
+                bundle["images"] = updated_images
+                st.session_state["last_images"] = updated_images
+                bundle["audio"] = {"scene_mp3s": [], "audio_path": "", "duration_seconds": 0, "engine": "pending"}
+                st.session_state["last_audio"] = bundle["audio"]
+                st.success("Generated cinematic script.")
+            except Exception as exc:
+                _append_bundle_error(bundle, "script", exc)
+                st.error(str(exc))
 
     if save_col.button("Save Script Changes", use_container_width=True, key="btn_topic_save_script_changes"):
         edited_script = str(st.session_state.get("script_editor_text") or "").strip()
