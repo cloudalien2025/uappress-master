@@ -67,7 +67,14 @@ PLANNING_LEAK_PATTERNS = [
     "source quality",
     "sparse data",
     "structured fields",
+    "tension shift",
+    "frame the central mystery",
 ]
+
+
+def contains_planning_language(text: str) -> bool:
+    lower = str(text or "").lower()
+    return any(token in lower for token in PLANNING_LEAK_PATTERNS)
 
 
 def _ensure_fallback_artifacts(
@@ -187,11 +194,13 @@ def generate_scene_mp3s(bundle: Dict[str, Any], *, openai_key: str, voice: str =
 
     script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
     scenes = script_bundle.get("scenes") if isinstance(script_bundle.get("scenes"), list) else []
-    validator_report = bundle.get("validator_report") if isinstance(bundle.get("validator_report"), dict) else {}
+    validator_report = script_bundle.get("validator") if isinstance(script_bundle.get("validator"), dict) else {}
     if not scenes:
         raise ValueError("Generate Script first")
     if not validator_report.get("ok"):
         raise ValueError("Script validator must pass before generating MP3s")
+    if not any(str(scene.get("voiceover") or "").strip() for scene in scenes if isinstance(scene, dict)):
+        raise ValueError("Script scenes must include voiceover before generating MP3s")
 
     from apps.video.tts_engine import generate_vo_audio
 
@@ -346,7 +355,8 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
     script_text = str(bundle_data.get("script_text") or script_result.get("text") or "").strip()
     script_scenes = script_result.get("scenes") if isinstance(script_result.get("scenes"), list) else []
     validator_report = bundle_data.get("validator_report") if isinstance(bundle_data.get("validator_report"), dict) else {}
-    script_ok = bool(validator_report.get("ok"))
+    script_validator = script_result.get("validator") if isinstance(script_result.get("validator"), dict) else {}
+    script_ok = bool((script_validator or validator_report).get("ok"))
     has_script = bool(script_text) and bool(script_scenes) and script_ok
 
     image_result = bundle_data.get("images") if isinstance(bundle_data.get("images"), dict) else {}
@@ -1053,7 +1063,13 @@ def plan_scenes(
     return scenes
 
 
-def write_scene(scene_plan_item: Dict[str, Any], fact_pack: Dict[str, Any], style_cfg: Dict[str, Any]) -> Dict[str, Any]:
+def write_scene(
+    scene_plan_item: Dict[str, Any],
+    fact_pack: Dict[str, Any],
+    style_cfg: Dict[str, Any],
+    *,
+    retry_instruction: str = "",
+) -> Dict[str, Any]:
     target_words = int(style_cfg.get("target_scene_words") or 420)
     evidence_ids = scene_plan_item.get("evidence_ids") if isinstance(scene_plan_item.get("evidence_ids"), list) else []
     anchor_facts = scene_plan_item.get("anchor_facts") if isinstance(scene_plan_item.get("anchor_facts"), list) else []
@@ -1064,21 +1080,22 @@ def write_scene(scene_plan_item: Dict[str, Any], fact_pack: Dict[str, Any], styl
     paragraphs: list[str] = []
     sentence_cursor = 0
     scene_number = int(scene_plan_item.get("scene_number") or 0)
-    goal_line = _clean_fact_text(str(scene_plan_item.get("goal") or ""))
-    tension = _clean_fact_text(str(scene_plan_item.get("tension_shift") or "new pressure"))
+    angle = _clean_fact_text(str(scene_plan_item.get("rewrite_angle") or ""))
     templates = [
-        f"Night falls on scene {scene_number}, and the record tightens around {tension}",
-        f"Scene {scene_number} turns on one verified detail tied to {tension}",
-        f"By scene {scene_number}, the timeline stops behaving cleanly under {tension}",
-        f"At this point, scene {scene_number} exposes a hard contradiction within {tension}",
-        f"By the end of scene {scene_number}, stakes move from theory to consequence through {tension}",
+        f"Witness accounts from phase {scene_number} sharpen the timeline around one verifiable event",
+        f"The archived record in phase {scene_number} pivots when independent reports align on a single detail",
+        f"In phase {scene_number}, the sequence no longer appears straightforward once multiple testimonies are compared",
+        f"A contradiction in phase {scene_number} forces direct comparison of competing claims and dates",
+        f"By the close of phase {scene_number}, the dispute shifts from speculation to measurable consequences",
     ]
     while len("\n\n".join(paragraphs).split()) < target_words:
         s1 = f"{templates[sentence_cursor % len(templates)]}. [{evidence_ids[sentence_cursor % len(evidence_ids)] if evidence_ids else 'S1'}]"
         fact = safe_facts[sentence_cursor % len(safe_facts)]
         s2 = f"{fact}. [{evidence_ids[(sentence_cursor + 1) % len(evidence_ids)] if evidence_ids else 'S1'}]"
-        s3 = f"{goal_line or 'What remains disputed is still unresolved'}. [{evidence_ids[(sentence_cursor + 2) % len(evidence_ids)] if evidence_ids else 'S1'}]"
-        s4 = f"Paragraph marker {sentence_cursor + 1} keeps pacing deliberate and clear."
+        angle_line = angle or f"At marker {scene_number}-{sentence_cursor + 1}, witnesses connect the dispute to {safe_facts[(sentence_cursor + 2) % len(safe_facts)].lower()}"
+        s3 = f"{angle_line}. [{evidence_ids[(sentence_cursor + 2) % len(evidence_ids)] if evidence_ids else 'S1'}]"
+        aftermath = safe_facts[(sentence_cursor + 1) % len(safe_facts)].lower()
+        s4 = f"Cycle {sentence_cursor + 1} reports ripple into later testimony, especially where records mention {aftermath}."
         paragraph = " ".join([s1, s2, s3, s4])
         paragraphs.append(paragraph)
         sentence_cursor += 1
@@ -1102,29 +1119,50 @@ def write_scene(scene_plan_item: Dict[str, Any], fact_pack: Dict[str, Any], styl
 
 def validate_script(scenes: list[Dict[str, Any]]) -> Dict[str, Any]:
     issues: list[str] = []
-    paragraphs: list[str] = []
-    first_sentences: list[str] = []
+    first_sentences: list[tuple[str, int]] = []
     corpus = []
+    failing_scene_indexes: set[int] = set()
+    seen_first_sentence: dict[str, int] = {}
 
-    for scene in scenes:
+    for index, scene in enumerate(scenes):
         voiceover = str(scene.get("voiceover") or "").strip()
         corpus.append(voiceover.lower())
         p = [seg.strip().lower() for seg in re.split(r"\n\s*\n", voiceover) if seg.strip()]
-        paragraphs.extend(p)
+        if len(p) != len(set(p)):
+            issues.append(f"Duplicate paragraphs detected in scene {index + 1}")
+            failing_scene_indexes.add(index)
         first = re.split(r"(?<=[.!?])\s+", voiceover.strip())[0].strip().lower()
         if first:
-            first_sentences.append(first)
+            first_sentences.append((first, index))
+            prior_idx = seen_first_sentence.get(first)
+            if prior_idx is not None:
+                issues.append(f"Repeated first sentence across scenes: {prior_idx + 1} and {index + 1}")
+                failing_scene_indexes.add(prior_idx)
+                failing_scene_indexes.add(index)
+            else:
+                seen_first_sentence[first] = index
         lower = voiceover.lower()
-        if any(token in lower for token in PLANNING_LEAK_PATTERNS):
+        if contains_planning_language(lower):
             issues.append(f"Planning language leakage in scene {scene.get('scene_number')}")
+            failing_scene_indexes.add(index)
         citation_hits = len(re.findall(r"\[S\d+\]", voiceover))
         if citation_hits > max(22, int(len(voiceover.split()) / 8)):
             issues.append(f"Citation clustering too dense in scene {scene.get('scene_number')}")
+            failing_scene_indexes.add(index)
 
-    if len(paragraphs) != len(set(paragraphs)):
-        issues.append("Duplicate paragraphs detected")
-    if len(first_sentences) != len(set(first_sentences)):
-        issues.append("Repeated first sentence across scenes")
+        lower_no_citations = re.sub(r"\[s\d+\]", "", lower)
+        tokens = re.findall(r"\b\w+\b", lower_no_citations)
+        for n in (8, 10, 12):
+            if len(tokens) < n:
+                continue
+            seen_ngrams: dict[str, int] = {}
+            for start in range(0, len(tokens) - n + 1):
+                ngram = " ".join(tokens[start:start + n])
+                seen_ngrams[ngram] = seen_ngrams.get(ngram, 0) + 1
+            if any(count >= 30 for count in seen_ngrams.values()):
+                issues.append(f"High n-gram repetition detected in scene {index + 1}")
+                failing_scene_indexes.add(index)
+                break
 
     for i in range(len(corpus)):
         for j in range(i + 1, len(corpus)):
@@ -1135,6 +1173,8 @@ def validate_script(scenes: list[Dict[str, Any]]) -> Dict[str, Any]:
             sim = len(a & b) / max(1, len(a | b))
             if sim > 0.985:
                 issues.append(f"Scene-to-scene similarity too high: {i+1} vs {j+1}")
+                failing_scene_indexes.add(i)
+                failing_scene_indexes.add(j)
                 break
 
     total_words = sum(len(str(scene.get("voiceover") or "").split()) for scene in scenes)
@@ -1143,7 +1183,12 @@ def validate_script(scenes: list[Dict[str, Any]]) -> Dict[str, Any]:
         "word_count": total_words,
         "estimated_runtime_minutes": round(total_words / WORDS_PER_MINUTE, 2),
     }
-    return {"ok": len(issues) == 0, "issues": sorted(set(issues))[:10], "stats": stats}
+    return {
+        "ok": len(issues) == 0,
+        "issues": sorted(set(issues))[:12],
+        "stats": stats,
+        "failing_scene_indexes": sorted(failing_scene_indexes),
+    }
 
 
 def build_timing_map(scenes: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -1184,15 +1229,10 @@ def generate_script(bundle: Dict[str, Any], runtime_minutes: int = 45, tts_mode:
     scenes = [write_scene(item, fact_pack, style_cfg) for item in scene_plan_items]
 
     validator_report = validate_script(scenes)
-    for _ in range(2):
+    for attempt in range(2):
         if validator_report.get("ok"):
             break
-        failing_indexes = set()
-        for issue in validator_report.get("issues") or []:
-            for hit in re.findall(r"(\d+)", str(issue)):
-                idx = int(hit) - 1
-                if 0 <= idx < len(scene_plan_items):
-                    failing_indexes.add(idx)
+        failing_indexes = set(validator_report.get("failing_scene_indexes") or [])
         if not failing_indexes:
             failing_indexes = {len(scene_plan_items) - 1}
         for idx in sorted(failing_indexes):
@@ -1200,9 +1240,14 @@ def generate_script(bundle: Dict[str, Any], runtime_minutes: int = 45, tts_mode:
             ids = current.get("evidence_ids") if isinstance(current.get("evidence_ids"), list) else []
             if ids:
                 current["evidence_ids"] = ids[1:] + ids[:1]
-            current["goal"] = f"Refined: {current.get('goal') or ''}".strip()
+            current["rewrite_angle"] = f"Fresh evidentiary angle attempt {attempt + 1} for scene {idx + 1}"
             scene_plan_items[idx] = current
-            scenes[idx] = write_scene(current, fact_pack, style_cfg)
+            scenes[idx] = write_scene(
+                current,
+                fact_pack,
+                style_cfg,
+                retry_instruction="DO NOT include any meta/planning language",
+            )
         validator_report = validate_script(scenes)
 
     if not validator_report.get("ok"):
@@ -1228,9 +1273,14 @@ def generate_script(bundle: Dict[str, Any], runtime_minutes: int = 45, tts_mode:
         "text": script_text,
         "locked": False,
         "engine": "planner-writer-validator-v1",
+        "validator": validator_report,
     }
 
-    bundle["scene_plan"] = {"scene_count": len(scene_plan_items), "runtime_minutes": runtime_minutes, "scenes": scene_plan_items}
+    bundle["scene_plan"] = {
+        "scene_count": len(scene_plan_items),
+        "runtime_minutes": runtime_minutes,
+        "scenes": scene_plan_items,
+    }
     bundle["script"] = result
     bundle["script_text"] = script_text
     bundle["validator_report"] = validator_report
@@ -1942,9 +1992,7 @@ if dossier:
 
     script_bundle = bundle.get("script") if isinstance(bundle.get("script"), dict) else {}
     script_scenes = script_bundle.get("scenes") if isinstance(script_bundle.get("scenes"), list) else []
-    generated_script_text = str(bundle.get("script_text") or script_bundle.get("text") or st.session_state.get("generated_script_text") or "").strip()
-    if not generated_script_text and script_scenes:
-        generated_script_text = "\n\n".join(str(scene.get("voiceover") or "").strip() for scene in script_scenes if isinstance(scene, dict))
+    generated_script_text = str(bundle.get("script_text") or "").strip()
 
     if "script_text" not in st.session_state:
         st.session_state["script_text"] = generated_script_text
@@ -2027,16 +2075,11 @@ if dossier:
             _append_bundle_error(bundle, "script_regen", exc)
             st.error(str(exc))
 
-    if save_col.button("Save Script Changes", use_container_width=True, key="btn_topic_save_script_changes"):
-        edited_script = str(st.session_state.get("script_editor_text") or "").strip()
-        bundle.setdefault("script", {})["text"] = edited_script
-        bundle["script"]["locked"] = True
-        st.session_state["script_text"] = edited_script
-        st.success("Script changes saved.")
-
     validator_report = bundle.get("validator_report") if isinstance(bundle.get("validator_report"), dict) else {}
-    scenes_exist = bool(bundle.get("script", {}).get("scenes"))
-    script_pass = bool(validator_report.get("ok"))
+    script_validator = bundle.get("script", {}).get("validator") if isinstance(bundle.get("script", {}), dict) else {}
+    scenes = bundle.get("script", {}).get("scenes") if isinstance(bundle.get("script", {}), dict) and isinstance(bundle.get("script", {}).get("scenes"), list) else []
+    scenes_exist = any(str(scene.get("voiceover") or "").strip() for scene in scenes if isinstance(scene, dict))
+    script_pass = bool((script_validator or validator_report).get("ok"))
     if mp3_col.button(
         "Generate MP3s (per scene)",
         use_container_width=True,
@@ -2053,8 +2096,7 @@ if dossier:
             _append_bundle_error(bundle, "audio_tts", exc)
             st.error(str(exc))
 
-    st.text_area("Script (editable)", key="script_editor_text", height=400)
-    bundle.setdefault("script", {})["text"] = str(st.session_state.get("script_editor_text") or "").strip()
+    st.text_area("Script (validated)", value=str(bundle.get("script_text") or ""), height=400, disabled=True)
 
     validator_report = bundle.get("validator_report") if isinstance(bundle.get("validator_report"), dict) else {}
     quality_stats = validator_report.get("stats") if isinstance(validator_report.get("stats"), dict) else {}
