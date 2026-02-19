@@ -6,36 +6,35 @@ test.describe("UAPpress Research Engine (Smoke)", () => {
     const url = baseURL || "http://127.0.0.1:8501";
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // Streamlit hydration can lag; wait for a stable marker from the app
     await expect(page.getByText("TEST_HOOK:APP_LOADED", { exact: false })).toBeVisible();
-
-    // Title
     await expect(page.getByText("UAPpress Research Engine", { exact: false })).toBeVisible();
 
-    // Fill topic (exact label match)
-    await page.getByLabel("Primary Topic", { exact: true }).fill("ODNI UAP Report 2023");
-
-    // Click run (form submit)
+    await page.getByLabel("Primary Topic", { exact: true }).fill("Phoenix Lights");
     await page.getByRole("button", { name: "Run Research", exact: true }).click();
 
-    // Wait for completion marker
     await expect(page.getByText("TEST_HOOK:RUN_DONE", { exact: false })).toBeVisible();
-
-    // Deterministic assertions (smoke-mode fixture)
     await expect(page.getByText("Research Complete", { exact: false })).toBeVisible();
 
-    // These strings may render below the fold; scroll them into view first.
-    const a = page.getByText("Mock Source A", { exact: false });
-    const b = page.getByText("Mock Source B", { exact: false });
-    const c = page.getByText("Mock Source C", { exact: false });
+    await page.getByRole("button", { name: "Build Fact Pack", exact: true }).click();
+    await page.getByRole("button", { name: "Build Beat Sheet", exact: true }).click();
+    await page.getByRole("button", { name: "Generate Script", exact: true }).click();
 
-    await a.first().scrollIntoViewIfNeeded();
-    await expect(a.first()).toBeVisible();
+    await expect(page.getByText("Script Quality", { exact: true })).toBeVisible();
+    await expect(page.getByText("PASS", { exact: false })).toBeVisible();
 
-    await b.first().scrollIntoViewIfNeeded();
-    await expect(b.first()).toBeVisible();
+    const scriptText = await page.locator('textarea[aria-label="Script (validated)"]').inputValue();
+    for (const banned of ["phase", "cycle", "marker", "in this section", "this scene"]) {
+      expect(scriptText.toLowerCase()).not.toContain(banned);
+    }
 
-    await c.first().scrollIntoViewIfNeeded();
-    await expect(c.first()).toBeVisible();
+    const repeatedPhraseCount = (scriptText.match(/On March 13, 1997/g) || []).length;
+    expect(repeatedPhraseCount).toBeLessThanOrEqual(2);
+
+    const sceneCardCount = await page.locator('text=/Voiceover — Scene \\d+/').count();
+    expect(sceneCardCount).toBeGreaterThanOrEqual(12);
+    expect(sceneCardCount).toBeLessThanOrEqual(20);
+
+    const mp3Button = page.getByRole("button", { name: "Generate MP3s (per scene)", exact: true });
+    await expect(mp3Button).toBeEnabled();
   });
 });

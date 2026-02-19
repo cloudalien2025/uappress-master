@@ -71,6 +71,39 @@ PLANNING_LEAK_PATTERNS = [
     "frame the central mystery",
 ]
 
+VOICEOVER_BANNED_TOKENS = [
+    "phase",
+    "cycle",
+    "marker",
+    "establishes the beat",
+    "tension shift",
+    "our objective",
+    "in this section",
+    "this scene",
+    "we begin with",
+    "according to documented records",
+    "records mention",
+]
+
+SHORT_SENTENCE_ALLOWLIST = {
+    "in phoenix",
+    "that night",
+    "nobody agrees",
+}
+
+STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "if", "while", "with", "without", "to", "from", "of", "on", "in", "at", "for", "by", "as", "is", "are", "was", "were", "be", "been", "being", "it", "its", "this", "that", "these", "those", "we", "they", "he", "she", "you", "i", "their", "his", "her", "our", "your", "not", "into", "about", "over", "under", "after", "before", "than", "then", "so", "because", "can", "could", "would", "should", "may", "might", "do", "does", "did", "done", "have", "has", "had",
+}
+
+REWRITE_ANGLES = [
+    "witness perspective",
+    "journalist reconstruction",
+    "investigator timeline audit",
+    "skeptic challenge",
+    "radar technician analysis",
+    "governor press conference aftermath",
+]
+
 
 def contains_planning_language(text: str) -> bool:
     lower = str(text or "").lower()
@@ -362,7 +395,7 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
     image_result = bundle_data.get("images") if isinstance(bundle_data.get("images"), dict) else {}
     image_paths_raw = image_result.get("images") if isinstance(image_result.get("images"), list) else []
     image_paths = [str(path).strip() for path in image_paths_raw if str(path).strip()]
-    has_images = bool(image_paths) and all(Path(path).exists() for path in image_paths)
+    has_images = bool(image_paths) and all(Path(path).exists() for path in image_paths) and len(image_paths) >= len(script_scenes)
 
     audio_result = bundle_data.get("audio") if isinstance(bundle_data.get("audio"), dict) else {}
     scene_mp3s_raw = audio_result.get("scene_mp3s") if isinstance(audio_result.get("scene_mp3s"), list) else []
@@ -379,6 +412,7 @@ def _artifact_readiness(bundle: Dict[str, Any] | None) -> Dict[str, Any]:
     ).strip()
     has_audio = (
         bool(scene_mp3_paths)
+        and len(scene_mp3_paths) >= len(script_scenes)
         and all(path and Path(path).exists() for path in scene_mp3_paths)
         and bool(audio_path)
         and Path(audio_path).exists()
@@ -1077,31 +1111,54 @@ def write_scene(
     if not safe_facts:
         safe_facts = ["What we can confirm is limited.", "What remains disputed is central to the case."]
 
+    banned_phrases = style_cfg.get("banned_phrases") if isinstance(style_cfg.get("banned_phrases"), list) else VOICEOVER_BANNED_TOKENS
+    prior_sentences = style_cfg.get("prior_normalized_sentences") if isinstance(style_cfg.get("prior_normalized_sentences"), set) else set()
     paragraphs: list[str] = []
     sentence_cursor = 0
     scene_number = int(scene_plan_item.get("scene_number") or 0)
-    angle = _clean_fact_text(str(scene_plan_item.get("rewrite_angle") or ""))
-    templates = [
-        f"Witness accounts from phase {scene_number} sharpen the timeline around one verifiable event",
-        f"The archived record in phase {scene_number} pivots when independent reports align on a single detail",
-        f"In phase {scene_number}, the sequence no longer appears straightforward once multiple testimonies are compared",
-        f"A contradiction in phase {scene_number} forces direct comparison of competing claims and dates",
-        f"By the close of phase {scene_number}, the dispute shifts from speculation to measurable consequences",
-    ]
+    angle = _clean_fact_text(str(scene_plan_item.get("rewrite_angle") or REWRITE_ANGLES[scene_number % len(REWRITE_ANGLES)]))
+    location_hint = str(fact_pack.get("topic") or "the case")
+    citations = evidence_ids or ["S1", "S2", "S3"]
+
+    def _normalize_sentence(value: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", value.lower())).strip()
+
     while len("\n\n".join(paragraphs).split()) < target_words:
-        s1 = f"{templates[sentence_cursor % len(templates)]}. [{evidence_ids[sentence_cursor % len(evidence_ids)] if evidence_ids else 'S1'}]"
-        fact = safe_facts[sentence_cursor % len(safe_facts)]
-        s2 = f"{fact}. [{evidence_ids[(sentence_cursor + 1) % len(evidence_ids)] if evidence_ids else 'S1'}]"
-        angle_line = angle or f"At marker {scene_number}-{sentence_cursor + 1}, witnesses connect the dispute to {safe_facts[(sentence_cursor + 2) % len(safe_facts)].lower()}"
-        s3 = f"{angle_line}. [{evidence_ids[(sentence_cursor + 2) % len(evidence_ids)] if evidence_ids else 'S1'}]"
-        aftermath = safe_facts[(sentence_cursor + 1) % len(safe_facts)].lower()
-        s4 = f"Cycle {sentence_cursor + 1} reports ripple into later testimony, especially where records mention {aftermath}."
-        paragraph = " ".join([s1, s2, s3, s4])
-        paragraphs.append(paragraph)
+        fact_a = safe_facts[sentence_cursor % len(safe_facts)]
+        fact_b = safe_facts[(sentence_cursor + 1) % len(safe_facts)]
+        cit_a = citations[sentence_cursor % len(citations)]
+        cit_b = citations[(sentence_cursor + 1) % len(citations)]
+        cit_c = citations[(sentence_cursor + 2) % len(citations)]
+        hook = [
+            f"Night falls over {location_hint}, and witnesses still argue about what moved across the sky.",
+            f"A timestamp, a skyline, and one unanswered question define the opening minutes of scene {scene_number}.",
+        ]
+        factual_spine = [
+            f"{fact_a}. [{cit_a}]",
+            f"Investigators test that claim against dispatch logs, newsroom notes, and public statements tied to {angle or location_hint}. [{cit_b}]",
+            f"{fact_b}. [{cit_c}]",
+        ]
+        contrast = [
+            f"Skeptics counter that perception, distance, and formation flying can mimic extraordinary motion in this segment of the record.",
+            f"Supporters respond that the timing and scale in scene {scene_number} remain hard to dismiss as a simple misread.",
+        ]
+        tease = [
+            "Next, the story leaves the sky and follows the paper trail.",
+            "What happens next is less about spectacle and more about who wrote what, and when.",
+        ]
+        candidate = " ".join([hook[sentence_cursor % 2], factual_spine[0], factual_spine[1], factual_spine[2], contrast[0], contrast[1], tease[sentence_cursor % 2]])
+        norm_candidate_sentences = [_normalize_sentence(s) for s in re.split(r"(?<=[.!?])\s+", candidate) if s.strip()]
+        if any(s and s in prior_sentences for s in norm_candidate_sentences):
+            sentence_cursor += 1
+            continue
+        paragraphs.append(candidate)
+        for sentence in norm_candidate_sentences:
+            if sentence:
+                prior_sentences.add(sentence)
         sentence_cursor += 1
 
     voiceover = "\n\n".join(paragraphs)
-    for banned in PLANNING_LEAK_PATTERNS:
+    for banned in set(list(PLANNING_LEAK_PATTERNS) + list(banned_phrases)):
         voiceover = re.sub(re.escape(banned), "", voiceover, flags=re.IGNORECASE)
     voiceover = re.sub(r"\s+", " ", voiceover).strip() if style_cfg.get("tts_mode") else voiceover
 
@@ -1117,78 +1174,122 @@ def write_scene(
     }
 
 
-def validate_script(scenes: list[Dict[str, Any]]) -> Dict[str, Any]:
-    issues: list[str] = []
-    first_sentences: list[tuple[str, int]] = []
-    corpus = []
+def validate_script_quality(scenes: list[Dict[str, Any]]) -> Dict[str, Any]:
+    failures: list[str] = []
     failing_scene_indexes: set[int] = set()
-    seen_first_sentence: dict[str, int] = {}
+    sentence_map: dict[str, list[int]] = {}
+    shingle_map: dict[str, list[int]] = {}
+    tokens_no_stopwords: list[str] = []
+    scene_date_place_hits: dict[str, set[int]] = {}
+    beat_line_total = 0
 
     for index, scene in enumerate(scenes):
         voiceover = str(scene.get("voiceover") or "").strip()
-        corpus.append(voiceover.lower())
-        p = [seg.strip().lower() for seg in re.split(r"\n\s*\n", voiceover) if seg.strip()]
-        if len(p) != len(set(p)):
-            issues.append(f"Duplicate paragraphs detected in scene {index + 1}")
+        if not voiceover:
+            failures.append(f"Scene {index + 1} has empty voiceover")
             failing_scene_indexes.add(index)
-        first = re.split(r"(?<=[.!?])\s+", voiceover.strip())[0].strip().lower()
-        if first:
-            first_sentences.append((first, index))
-            prior_idx = seen_first_sentence.get(first)
-            if prior_idx is not None:
-                issues.append(f"Repeated first sentence across scenes: {prior_idx + 1} and {index + 1}")
-                failing_scene_indexes.add(prior_idx)
-                failing_scene_indexes.add(index)
-            else:
-                seen_first_sentence[first] = index
+            continue
+        words = re.findall(r"\b[\w']+\b", voiceover)
+        if len(words) < 260 or len(words) > 520:
+            failures.append(f"Scene {index + 1} word count out of range (260-520): {len(words)}")
+            failing_scene_indexes.add(index)
         lower = voiceover.lower()
-        if contains_planning_language(lower):
-            issues.append(f"Planning language leakage in scene {scene.get('scene_number')}")
-            failing_scene_indexes.add(index)
-        citation_hits = len(re.findall(r"\[S\d+\]", voiceover))
-        if citation_hits > max(22, int(len(voiceover.split()) / 8)):
-            issues.append(f"Citation clustering too dense in scene {scene.get('scene_number')}")
-            failing_scene_indexes.add(index)
-
-        lower_no_citations = re.sub(r"\[s\d+\]", "", lower)
-        tokens = re.findall(r"\b\w+\b", lower_no_citations)
-        for n in (8, 10, 12):
-            if len(tokens) < n:
-                continue
-            seen_ngrams: dict[str, int] = {}
-            for start in range(0, len(tokens) - n + 1):
-                ngram = " ".join(tokens[start:start + n])
-                seen_ngrams[ngram] = seen_ngrams.get(ngram, 0) + 1
-            if any(count >= 30 for count in seen_ngrams.values()):
-                issues.append(f"High n-gram repetition detected in scene {index + 1}")
+        for token in VOICEOVER_BANNED_TOKENS:
+            if token in lower:
+                failures.append(f"Banned meta token in scene {index + 1}: {token}")
                 failing_scene_indexes.add(index)
-                break
 
-    for i in range(len(corpus)):
-        for j in range(i + 1, len(corpus)):
-            a = set(corpus[i].split())
-            b = set(corpus[j].split())
-            if not a or not b:
-                continue
-            sim = len(a & b) / max(1, len(a | b))
-            if sim > 0.985:
-                issues.append(f"Scene-to-scene similarity too high: {i+1} vs {j+1}")
-                failing_scene_indexes.add(i)
-                failing_scene_indexes.add(j)
-                break
+        beat_line_total += len(re.findall(r"\bpause\.\b", lower))
+
+        scene_citations = re.findall(r"\[S\d+\]", voiceover)
+        if not scene_citations:
+            failures.append(f"Scene {index + 1} has no citations")
+            failing_scene_indexes.add(index)
+        citation_counts: dict[str, int] = {}
+        for tag in scene_citations:
+            citation_counts[tag] = citation_counts.get(tag, 0) + 1
+        overused = [tag for tag, count in citation_counts.items() if count > 3]
+        if overused:
+            failures.append(f"Scene {index + 1} overuses citations: {', '.join(overused)}")
+            failing_scene_indexes.add(index)
+
+        # Sentence repetition detection.
+        for sentence in [s.strip() for s in re.split(r"(?<=[.!?])\s+", voiceover) if s.strip()]:
+            norm_sentence = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", sentence.lower())).strip()
+            if norm_sentence:
+                sentence_map.setdefault(norm_sentence, []).append(index)
+
+        # 12-word shingle repetition detection.
+        lower_no_citations = re.sub(r"\[s\d+\]", "", lower)
+        scene_tokens = re.findall(r"\b\w+\b", lower_no_citations)
+        for token in scene_tokens:
+            if token not in STOPWORDS:
+                tokens_no_stopwords.append(token)
+        for start in range(0, max(0, len(scene_tokens) - 12 + 1)):
+            shingle = " ".join(scene_tokens[start:start + 12])
+            shingle_map.setdefault(shingle, []).append(index)
+
+        date_place_patterns = re.findall(r"\b(?:on\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\s+in\s+[a-z][a-z\s]+", lower)
+        for phrase in date_place_patterns:
+            clean_phrase = re.sub(r"\s+", " ", phrase).strip()
+            scene_date_place_hits.setdefault(clean_phrase, set()).add(index)
+
+        variety_hit = bool(
+            re.search(r"\b(?:mr\.?|mrs\.?|dr\.?|governor|officer|pilot|reporter|witness)\s+[A-Z][a-z]+", voiceover)
+            or re.search(r"\b(?:department|university|air force|faa|nasa|odni|newsroom|police|city hall)\b", lower)
+            or re.search(r"\b(?:phoenix|arizona|nevada|washington|luke air force base|sky harbor)\b", lower)
+            or "witness said" in lower
+        )
+        if not variety_hit:
+            failures.append(f"Scene {index + 1} missing required named detail/person/institution/witness paraphrase")
+            failing_scene_indexes.add(index)
+
+    for sentence, scene_indexes in sentence_map.items():
+        if len(scene_indexes) > 1 and sentence not in SHORT_SENTENCE_ALLOWLIST and len(sentence.split()) > 2:
+            failures.append(f"Repeated sentence across script: '{sentence[:80]}'")
+            failing_scene_indexes.update(scene_indexes)
+
+    for shingle, scene_indexes in shingle_map.items():
+        if len(scene_indexes) > 1:
+            failures.append(f"Repeated 12-word shingle detected: '{shingle[:80]}'")
+            failing_scene_indexes.update(scene_indexes)
+
+    unique_tokens = len(set(tokens_no_stopwords))
+    total_tokens = len(tokens_no_stopwords)
+    unique_token_ratio = (unique_tokens / total_tokens) if total_tokens else 0.0
+    if unique_token_ratio < 0.22:
+        failures.append(f"Low lexical diversity ratio: {unique_token_ratio:.3f} < 0.22")
+
+    for phrase, seen_in_scenes in scene_date_place_hits.items():
+        if len(seen_in_scenes) > 2:
+            failures.append(f"Headline loop detected (>2 scenes): {phrase}")
+            failing_scene_indexes.update(seen_in_scenes)
+
+    if beat_line_total > 10:
+        failures.append("Beat line overuse: 'Pause.' exceeds 10 total occurrences")
 
     total_words = sum(len(str(scene.get("voiceover") or "").split()) for scene in scenes)
-    stats = {
+    metrics = {
         "scene_count": len(scenes),
         "word_count": total_words,
         "estimated_runtime_minutes": round(total_words / WORDS_PER_MINUTE, 2),
+        "unique_token_ratio": round(unique_token_ratio, 4),
+        "repeated_sentence_count": sum(1 for sentence, indexes in sentence_map.items() if len(indexes) > 1),
+        "repeated_shingle_count": sum(1 for shingle, indexes in shingle_map.items() if len(indexes) > 1),
+        "pause_line_total": beat_line_total,
     }
     return {
-        "ok": len(issues) == 0,
-        "issues": sorted(set(issues))[:12],
-        "stats": stats,
+        "ok": len(failures) == 0,
+        "failures": sorted(set(failures))[:40],
+        "issues": sorted(set(failures))[:40],
+        "metrics": metrics,
+        "stats": metrics,
         "failing_scene_indexes": sorted(failing_scene_indexes),
     }
+
+
+def validate_script(scenes: list[Dict[str, Any]]) -> Dict[str, Any]:
+    return validate_script_quality(scenes)
 
 
 def build_timing_map(scenes: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -1225,39 +1326,57 @@ def generate_script(bundle: Dict[str, Any], runtime_minutes: int = 45, tts_mode:
     style_cfg = {
         "tts_mode": tts_mode,
         "target_scene_words": max(280, int((runtime_minutes * WORDS_PER_MINUTE) / max(1, len(scene_plan_items)))),
+        "banned_phrases": VOICEOVER_BANNED_TOKENS,
+        "prior_normalized_sentences": set(),
     }
     scenes = [write_scene(item, fact_pack, style_cfg) for item in scene_plan_items]
 
-    validator_report = validate_script(scenes)
-    for attempt in range(2):
+    validator_report = validate_script_quality(scenes)
+    per_scene_retry_counts: dict[int, int] = {idx: 0 for idx in range(len(scene_plan_items))}
+    for _ in range(2):
         if validator_report.get("ok"):
             break
-        failing_indexes = set(validator_report.get("failing_scene_indexes") or [])
+        failing_indexes = sorted(set(validator_report.get("failing_scene_indexes") or []))
         if not failing_indexes:
-            failing_indexes = {len(scene_plan_items) - 1}
-        for idx in sorted(failing_indexes):
+            break
+        for idx in failing_indexes:
+            if per_scene_retry_counts.get(idx, 0) >= 2:
+                continue
             current = dict(scene_plan_items[idx])
             ids = current.get("evidence_ids") if isinstance(current.get("evidence_ids"), list) else []
             if ids:
                 current["evidence_ids"] = ids[1:] + ids[:1]
-            current["rewrite_angle"] = f"Fresh evidentiary angle attempt {attempt + 1} for scene {idx + 1}"
+            current["rewrite_angle"] = REWRITE_ANGLES[(idx + per_scene_retry_counts[idx]) % len(REWRITE_ANGLES)]
+            prior_sentences = set()
+            for scene_idx, scene in enumerate(scenes):
+                if scene_idx == idx:
+                    continue
+                for sentence in re.split(r"(?<=[.!?])\s+", str(scene.get("voiceover") or "")):
+                    normalized = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", sentence.lower())).strip()
+                    if normalized:
+                        prior_sentences.add(normalized)
+            scene_style_cfg = dict(style_cfg)
+            scene_style_cfg["prior_normalized_sentences"] = prior_sentences
             scene_plan_items[idx] = current
             scenes[idx] = write_scene(
                 current,
                 fact_pack,
-                style_cfg,
-                retry_instruction="DO NOT include any meta/planning language",
+                scene_style_cfg,
+                retry_instruction="DO NOT reuse any prior sentences. Use a fresh POV and new evidence order.",
             )
-        validator_report = validate_script(scenes)
+            per_scene_retry_counts[idx] = per_scene_retry_counts.get(idx, 0) + 1
+        validator_report = validate_script_quality(scenes)
 
     if not validator_report.get("ok"):
+        bundle["script_text"] = ""
+        bundle["script"] = {"text": "", "scenes": scenes, "locked": False, "validator": validator_report}
         bundle["validator_report"] = validator_report
         raise RuntimeError("Script validator failed. Regenerate failing scenes and try again.")
 
     script_text = "\n\n".join(
-        f"--- Scene {int(scene.get('scene_number') or 0)}: {scene.get('scene_title') or ''} ---\n{str(scene.get('voiceover') or '').strip()}"
-        for scene in scenes
-    )
+        f"Scene {int(scene.get('scene_number') or 0)} — {scene.get('scene_title') or ''}\n{str(scene.get('voiceover') or '').strip()}"
+        for scene in scenes if str(scene.get("voiceover") or "").strip()
+    ).strip()
     total_words = sum(int(scene.get("word_count") or 0) for scene in scenes)
     source_map = {f"S{int(s.get('idx') or i+1)}": {"idx": int(s.get('idx') or i+1), "title": s.get("title"), "url": s.get("url")} for i, s in enumerate((fact_pack.get("sources_used") or [])) if isinstance(s, dict)}
 
@@ -2054,10 +2173,14 @@ if dossier:
                 st.session_state["last_images"] = updated_images
                 bundle["audio"] = {"scene_mp3s": [], "audio_path": "", "duration_seconds": 0, "engine": "pending"}
                 st.session_state["last_audio"] = bundle["audio"]
-                st.success("Generated cinematic script.")
+                st.success("Generated documentary script.")
             except Exception as exc:
                 _append_bundle_error(bundle, "script", exc)
                 st.error(str(exc))
+                report = bundle.get("validator_report") if isinstance(bundle.get("validator_report"), dict) else {}
+                failures = report.get("failures") if isinstance(report.get("failures"), list) else []
+                if failures:
+                    st.error("Script quality failures:\n- " + "\n- ".join(failures[:12]))
 
     if regen_col.button("Regenerate failing scenes", use_container_width=True, key="btn_topic_regen_failing_scenes"):
         try:
@@ -2074,6 +2197,10 @@ if dossier:
         except Exception as exc:
             _append_bundle_error(bundle, "script_regen", exc)
             st.error(str(exc))
+            report = bundle.get("validator_report") if isinstance(bundle.get("validator_report"), dict) else {}
+            failures = report.get("failures") if isinstance(report.get("failures"), list) else []
+            if failures:
+                st.error("Script quality failures:\n- " + "\n- ".join(failures[:12]))
 
     validator_report = bundle.get("validator_report") if isinstance(bundle.get("validator_report"), dict) else {}
     script_validator = bundle.get("script", {}).get("validator") if isinstance(bundle.get("script", {}), dict) else {}
@@ -2096,6 +2223,26 @@ if dossier:
             _append_bundle_error(bundle, "audio_tts", exc)
             st.error(str(exc))
 
+    st.subheader("Script (Scenes)")
+    script_scene_items = bundle.get("script", {}).get("scenes") if isinstance(bundle.get("script", {}), dict) else []
+    if isinstance(script_scene_items, list) and script_scene_items:
+        for i, scene in enumerate(script_scene_items, start=1):
+            if not isinstance(scene, dict):
+                continue
+            title = str(scene.get("scene_title") or f"Scene {i}")
+            voiceover = str(scene.get("voiceover") or "")
+            words = len(voiceover.split())
+            cites = len(re.findall(r"\[S\d+\]", voiceover))
+            st.markdown(f"**{title}** · {words} words · {cites} citations")
+            with st.expander(f"Voiceover — Scene {i}", expanded=False):
+                st.text_area(
+                    f"scene_voiceover_{i}",
+                    value=voiceover,
+                    height=180,
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+
     st.text_area("Script (validated)", value=str(bundle.get("script_text") or ""), height=400, disabled=True)
 
     validator_report = bundle.get("validator_report") if isinstance(bundle.get("validator_report"), dict) else {}
@@ -2109,7 +2256,8 @@ if dossier:
         "estimated_runtime_minutes": quality_stats.get("estimated_runtime_minutes", round(len(str(bundle.get("script_text") or "").split()) / WORDS_PER_MINUTE, 2)),
     })
     if not validator_report.get("ok"):
-        st.warning("; ".join((validator_report.get("issues") or ["Validator has unresolved issues"])[:3]))
+        failure_lines = validator_report.get("failures") or validator_report.get("issues") or ["Validator has unresolved issues"]
+        st.error("\n".join([f"• {line}" for line in failure_lines[:8]]))
 
     timing_map = bundle.get("timing") if isinstance(bundle.get("timing"), list) else []
     if timing_map:
